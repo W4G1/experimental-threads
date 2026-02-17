@@ -154,7 +154,7 @@ const packageJson = {
   name: "experimental-threads",
   version: VERSION,
   description:
-    "Highly experimental threading that works in Deno, Bun and Node.",
+    "Highly experimental multithreading runtime in JavaScript using lexical scope analysis and shared memory rehydration. Works in Deno, Bun and Node. ",
   keywords: [
     "experimental-threads",
     "multithreading",
