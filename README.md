@@ -32,7 +32,7 @@ import { v4: uuiv4 } from "uuid";
 
 const data = { hello: 'world' };
 
-// We must use eval() to capture the local scope of 'data'
+// We must use eval() to capture the runtime value of 'data'
 const result = await eval(spawn(() => {
   // 'data' is available inside the Worker
   console.log(data.hello); // "world"
@@ -41,7 +41,7 @@ const result = await eval(spawn(() => {
   return uuiv4();
 }));
 
-console.log(result); // 'cca68b4c-7416-4b44-ba94-9cf6ca90bf59'
+console.log(result); // "cca68b4c-7416-4b44-ba94-9cf6ca90bf59"
 ```
 
 ## Why must `spawn()` be wrapped in `eval()`?
