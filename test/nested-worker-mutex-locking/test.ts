@@ -48,14 +48,14 @@ Deno.test("Nested Worker Mutex Locking", async () => {
         view[0] = 3;
       }));
 
-      await delay(1000);
+      await delay(2000);
 
       guard.unlock();
 
       await task2;
     }));
 
-    await delay(1000);
+    await delay(2000);
 
     // Unlock Main, allowing W2 to finish
     guard.unlock();

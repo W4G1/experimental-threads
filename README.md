@@ -14,7 +14,7 @@
 
 <br/>
 
-`experimental-threads` is a highly experimental concurrency library for JavaScript and TypeScript (Node.js, Deno, Bun). It enables the execution of inline closures within isolated Web Workers by combining static AST analysis, lexical scope capture, and shared memory hydration.
+`experimental-threads` is a highly experimental concurrency library for server-side JavaScript and TypeScript (Node.js, Deno, Bun). It enables the execution of inline closures within isolated Web Workers by combining static AST analysis, lexical scope capture, and shared memory hydration.
 
 By abstracting away standard Web Worker message passing and the need for separate entry files, this library provides an API structurally similar to thread spawning in systems languages like Rust or Go.
 
@@ -150,4 +150,4 @@ The `Global<T>` wrapper solves this by guaranteeing that a shared resource point
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE.md) for details.
