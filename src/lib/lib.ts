@@ -1,7 +1,7 @@
 import ts from "typescript";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { join, resolve } from "node:path";
+import { extname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import process from "node:process";
 import { Global, GLOBAL_MEMORY } from "./primitives.ts";
@@ -151,7 +151,8 @@ globalThis.__worker_wrapper__ = async (
         mkdirSync(workerDir, { recursive: true });
       }
 
-      filePath = join(workerDir, `${hash}.ts`);
+      const fileExt = extname(fileURLToPath(url)) || ".js";
+      filePath = join(workerDir, `${hash}${fileExt}`);
       writeFileSync(filePath, finalWorkerCode);
       PATH_CACHE.set(signatureKey, filePath);
     }
@@ -298,12 +299,10 @@ function isValidUsage(n: ts.Node) {
 }
 
 function defines(n: any, name: string): boolean {
-  // Function parameters (including destructuring)
   if (ts.isFunctionLike(n)) {
     return n.parameters.some((p) => bindingHasName(p.name, name));
   }
 
-  // Variable declarations in blocks
   if ((ts.isBlock(n) || n.kind === ts.SyntaxKind.SourceFile) && n.statements) {
     return n.statements.some((s: any) => {
       if (ts.isVariableStatement(s)) {
@@ -333,7 +332,6 @@ function defines(n: any, name: string): boolean {
     });
   }
 
-  // For loop variables
   if (
     ts.isForStatement(n) && n.initializer &&
     ts.isVariableDeclarationList(n.initializer)
@@ -343,7 +341,6 @@ function defines(n: any, name: string): boolean {
     );
   }
 
-  // Catch clause variables
   if (ts.isCatchClause(n) && n.variableDeclaration) {
     return bindingHasName(n.variableDeclaration.name, name);
   }
@@ -356,16 +353,12 @@ function bindingHasName(node: ts.BindingName, name: string): boolean {
     return node.text === name;
   }
 
-  // Handle ObjectBindingPattern ({ a, b: c })
   if (ts.isObjectBindingPattern(node)) {
     return node.elements.some((el) => bindingHasName(el.name, name));
   }
 
-  // Handle ArrayBindingPattern ([a, b])
   if (ts.isArrayBindingPattern(node)) {
     return node.elements.some((el) => {
-      // Skip holes in array destructuring: const [, b] = arr
-      // ts.isBindingElement ensures 'el' has a 'name' property
       if (!ts.isBindingElement(el)) return false;
       return bindingHasName(el.name, name);
     });
@@ -376,10 +369,18 @@ function bindingHasName(node: ts.BindingName, name: string): boolean {
 
 function patchImports(code: string, base: string) {
   const r = (p: string) => /^\.\.?\//.test(p) ? new URL(p, base).href : p;
+
+  const sourceFile = ts.createSourceFile(
+    fileURLToPath(base),
+    code,
+    ts.ScriptTarget.ESNext,
+    true,
+  );
+
   const t: ts.TransformerFactory<ts.SourceFile> = (c) => (n) => {
     const v: ts.Visitor = (node) => {
       if (
-        ts.isStringLiteral(node) &&
+        ts.isStringLiteral(node) && node.parent &&
         (ts.isImportDeclaration(node.parent) ||
           ts.isExportDeclaration(node.parent))
       ) {
@@ -389,10 +390,15 @@ function patchImports(code: string, base: string) {
     };
     return ts.visitNode(n, v) as ts.SourceFile;
   };
-  return ts.transpileModule(code, {
-    compilerOptions: { target: ts.ScriptTarget.ESNext },
-    transformers: { before: [t] },
-  }).outputText;
+
+  const result = ts.transform(sourceFile, [t]);
+  const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
+
+  return printer.printNode(
+    ts.EmitHint.SourceFile,
+    result.transformed[0]!,
+    sourceFile,
+  );
 }
 
 export function shutdown() {
