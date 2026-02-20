@@ -65,7 +65,7 @@ export function hydrate(obj: any): any {
 }
 
 export abstract class SharedStruct {
-  state: Int32Array;
+  protected state: Int32Array;
 
   constructor(
     readonly __cls: string,
@@ -86,11 +86,11 @@ export abstract class SharedStruct {
     this.state = new Int32Array(buffer);
   }
 
-  get buffer(): SharedArrayBuffer {
+  protected get buffer(): SharedArrayBuffer {
     return this.state.buffer as SharedArrayBuffer;
   }
 
-  _replaceBuffer(newBuffer: SharedArrayBuffer) {
+  protected _replaceBuffer(newBuffer: SharedArrayBuffer) {
     this.state = new Int32Array(newBuffer);
   }
 }
@@ -128,6 +128,7 @@ export class Global<T extends SharedStruct | SharedArrayBuffer> {
     if (this._inner instanceof SharedArrayBuffer) {
       internalBuffer = this._inner;
     } else {
+      // @ts-expect-error private field access
       internalBuffer = this._inner.buffer;
     }
 
@@ -176,6 +177,7 @@ export class Global<T extends SharedStruct | SharedArrayBuffer> {
     if (this._inner instanceof SharedArrayBuffer) {
       this._inner = buffer as any;
     } else {
+      // @ts-expect-error private field access
       this._inner._replaceBuffer(buffer);
     }
   }
