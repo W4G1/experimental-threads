@@ -1,64 +1,72 @@
 import { assertEquals } from "@std/assert";
 import { delay } from "@std/async";
 import { shutdown, spawn } from "experimental-threads";
-import {
-  getCounter,
-  getSignal,
-  setCounter,
-  setSignal,
-  sharedMutex,
-} from "./shared.ts";
+import { sharedMutex } from "./shared.ts";
 
 Deno.test("Nested Worker Mutex Locking", async () => {
   try {
-    setSignal(0);
-
     // Main thread takes the lock first
     // We store the guard to access data and to unlock later
-    const guard = await sharedMutex.value.lock();
+    using guard = await sharedMutex.value.lock();
 
     // Use the exposed value from the lock to set data safely
     new Int32Array(guard.value).set([1]);
 
     // Start worker chain (Main -> W1 -> W2)
     const task = eval(spawn(async () => {
-      // W1 reads unsafely (without lock) to verify Main thread's write
-      if (getCounter() !== 1) throw new Error("W1 read failed");
+      const start = performance.now();
+      using guard = await sharedMutex.value.lock();
 
-      // W1 updates unsafely
-      setCounter(2);
+      // Verify we actually waited for parent thread to unlock
+      if (performance.now() - start < 10) {
+        throw new Error("Mutex failed to block");
+      }
 
-      await eval(spawn(async () => {
-        // Signal we are ready, then try to lock
-        setSignal(1);
+      const view = new Int32Array(guard.value);
 
+      assertEquals(view[0], 1);
+
+      view[0] = 2;
+
+      const task2 = eval(spawn(async () => {
         const start = performance.now();
 
         // This attempts to lock. It will block until Main calls guard[Symbol.dispose]()
-        using _lock = await sharedMutex.value.lock();
+        using guard = await sharedMutex.value.lock();
 
-        // Verify we actually waited for Main to unlock
+        // Verify we actually waited for parent thread to unlock
         if (performance.now() - start < 10) {
           throw new Error("Mutex failed to block");
         }
 
+        const view = new Int32Array(guard.value);
+
         // Now we safely hold the lock, verify W1's write
-        if (getCounter() !== 2) throw new Error("W2 read failed");
+        if (view[0] !== 2) throw new Error("W2 read failed");
 
         // Write final value
-        setCounter(3);
+        view[0] = 3;
       }));
+
+      await delay(1000);
+
+      guard.unlock();
+
+      await task2;
     }));
 
-    // Wait for W2 to be ready and blocked
-    while (getSignal() === 0) await delay(10);
-    await delay(20); // Small buffer to ensure W2 hit the lock
+    await delay(1000);
 
     // Unlock Main, allowing W2 to finish
-    guard[Symbol.dispose]();
+    guard.unlock();
 
     await task;
-    assertEquals(getCounter(), 3);
+
+    {
+      using guard = await sharedMutex.value.lock();
+      const view = new Int32Array(guard.value);
+      assertEquals(view[0], 3);
+    }
   } finally {
     shutdown();
   }
