@@ -255,7 +255,9 @@ export class MutexGuard<T> {
   }
 }
 
-export class Mutex<T = unknown> extends SharedStruct {
+export class Mutex<
+  T extends SharedArrayBuffer | SharedStruct = SharedArrayBuffer,
+> extends SharedStruct {
   private static readonly IDX_LOCK_STATE = 0;
   private static readonly UNLOCKED = 0;
   private static readonly LOCKED = 1;
@@ -269,7 +271,7 @@ export class Mutex<T = unknown> extends SharedStruct {
     super("Mutex", superArg, 1);
 
     if (isStateBuffer) {
-      this._data = undefined as T;
+      this._data = undefined as unknown as T;
     } else {
       this._data = arg as T;
     }
