@@ -5,9 +5,9 @@
 [![Status](https://img.shields.io/badge/status-experimental-orange.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![TypeScript](https://img.shields.io/badge/Language-TypeScript-blue.svg)]()
-[![Node.js](https://img.shields.io/badge/Node.js-6DA55F?logo=node.js&logoColor=white)](#)
-[![Deno](https://img.shields.io/badge/Deno-000?logo=deno&logoColor=fff)](#)
-[![Bun](https://img.shields.io/badge/Bun-000?logo=bun&logoColor=fff)](#)
+[![Node.js](https://img.shields.io/badge/Node.js-6DA55F?logo=node.js&logoColor=white)]()
+[![Deno](https://img.shields.io/badge/Deno-000?logo=deno&logoColor=fff)]()
+[![Bun](https://img.shields.io/badge/Bun-000?logo=bun&logoColor=fff)]()
 [![GitHub Repo stars](https://img.shields.io/github/stars/W4G1/experimental-threads?logo=github&label=Star&labelColor=rgb(26%2C%2030%2C%2035)&color=rgb(13%2C%2017%2C%2023))](https://github.com/W4G1/experimental-threads)
 
 </div>
@@ -150,4 +150,4 @@ The `Global<T>` wrapper solves this by guaranteeing that a shared resource point
 
 ## License
 
-MIT License. See [LICENSE](LICENSE.md) for details.
+MIT License. See [LICENSE](LICENSE) for details.
