@@ -141,14 +141,8 @@ globalThis.__worker_wrapper__ = async (
       }
 
       const wrapper = `(({${finalVars.join(",")}}) => ${fnStr})`;
-      let finalWorkerCode = patchedCode +
+      const finalWorkerCode = patchedCode +
         WORKER_BODY.replace("%FN%", wrapper);
-
-      const nocheckPrefix = "// @ts-nocheck: Auto-generated worker file\n";
-
-      if (!finalWorkerCode.startsWith(nocheckPrefix)) {
-        finalWorkerCode = nocheckPrefix + finalWorkerCode;
-      }
 
       const hash = createHash("md5").update(signatureKey).digest("hex");
       const workerDir = resolve(process.cwd(), ".workers");
@@ -157,7 +151,7 @@ globalThis.__worker_wrapper__ = async (
         mkdirSync(workerDir, { recursive: true });
       }
 
-      filePath = join(workerDir, `${hash}.js`);
+      filePath = join(workerDir, `${hash}.ts`);
       writeFileSync(filePath, finalWorkerCode);
       PATH_CACHE.set(signatureKey, filePath);
     }
