@@ -1,4 +1,4 @@
-// @ts-nocheck polyfill file for node
+// @ts-nocheck: polyfill file for node
 
 import {
   isMainThread,
