@@ -202,7 +202,7 @@ await Deno.writeTextFile(
 );
 
 try {
-  await Deno.copyFile("LICENSE.md", path.join(OUT_DIR, "LICENSE"));
+  await Deno.copyFile("LICENSE", path.join(OUT_DIR, "LICENSE"));
   await Deno.copyFile("README.md", path.join(OUT_DIR, "README.md"));
 } catch (e) {
   console.error(e);
