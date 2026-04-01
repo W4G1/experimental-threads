@@ -168,7 +168,7 @@ globalThis.__worker_wrapper__ = async (
 
     entry = {
       worker: new Worker(fileUrl, { type: "module" }),
-      busy: false,
+      busy: true,
       filePath,
       initialized: false,
     };
@@ -178,9 +178,8 @@ globalThis.__worker_wrapper__ = async (
       clearTimeout(entry.timer);
       delete entry.timer;
     }
+    entry.busy = true;
   }
-
-  entry.busy = true;
 
   return new Promise((resolve, reject) => {
     const w = entry.worker;
