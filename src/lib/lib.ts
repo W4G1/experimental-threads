@@ -183,6 +183,7 @@ globalThis.__worker_wrapper__ = async (
 
   return new Promise((resolve, reject) => {
     const w = entry.worker;
+    let cleaned = false;
 
     const sendMessage = () => {
       const globalMemory = Object.fromEntries(GLOBAL_MEMORY.entries());
@@ -210,6 +211,8 @@ globalThis.__worker_wrapper__ = async (
     };
 
     const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
       w.removeEventListener("message", onMsg);
       w.removeEventListener("error", onError);
       entry!.busy = false;
