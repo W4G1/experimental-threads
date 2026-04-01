@@ -28,6 +28,9 @@ globalThis.ErrorEvent = class ErrorEvent extends Event {
 if (isMainThread) {
   globalThis.Worker = class Worker extends EventTarget {
     private _worker: any;
+    private _onMessage: (data: any) => void;
+    private _onError: (error: Error) => void;
+    private _onExit: (code: number) => void;
 
     constructor(scriptURL: string | URL, options?: WorkerOptions) {
       super();
@@ -36,22 +39,22 @@ if (isMainThread) {
 
       this._worker = new NodeWorker(finalPath, { ...options });
 
-      this._worker.on("message", (data: any) => {
+      this._onMessage = (data: any) => {
         const event = new MessageEvent("message", { data });
         this.dispatchEvent(event);
         if (this.onmessage) this.onmessage(event);
-      });
+      };
 
-      this._worker.on("error", (error: Error) => {
+      this._onError = (error: Error) => {
         const event = new ErrorEvent("error", {
           error,
           message: error.message,
         });
         this.dispatchEvent(event);
         if (this.onerror) this.onerror(event);
-      });
+      };
 
-      this._worker.on("exit", (code: number) => {
+      this._onExit = (code: number) => {
         if (code !== 0) {
           const err = new Error(`Worker stopped with exit code ${code}`);
           const event = new ErrorEvent("error", {
@@ -61,7 +64,11 @@ if (isMainThread) {
           this.dispatchEvent(event);
           if (this.onerror) this.onerror(event);
         }
-      });
+      };
+
+      this._worker.on("message", this._onMessage);
+      this._worker.on("error", this._onError);
+      this._worker.on("exit", this._onExit);
     }
 
     postMessage(message: any, transfer: Transferable[]) {
@@ -69,6 +76,9 @@ if (isMainThread) {
     }
 
     terminate() {
+      this._worker.off("message", this._onMessage);
+      this._worker.off("error", this._onError);
+      this._worker.off("exit", this._onExit);
       this._worker.terminate();
     }
 
