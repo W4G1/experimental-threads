@@ -44,6 +44,7 @@ interface PoolEntry {
   busy: boolean;
   timer?: number;
   filePath: string;
+  initialized: boolean;
 }
 
 const WORKER_POOL = new Map<string, PoolEntry[]>();
@@ -69,7 +70,8 @@ self.onmessage = async ({ data }) => {
   } catch (error) {
     postMessage({ type: 'error', error });
   }
-}`;
+};
+postMessage({ type: 'ready' });`;
 
 export function spawn<T>(fn: () => T): WorkerScript<T> {
   const site = getCallSite(import.meta.url);
@@ -168,6 +170,7 @@ globalThis.__worker_wrapper__ = async (
       worker: new Worker(fileUrl, { type: "module" }),
       busy: false,
       filePath,
+      initialized: false,
     };
     pool.push(entry);
   } else {
@@ -182,9 +185,22 @@ globalThis.__worker_wrapper__ = async (
   return new Promise((resolve, reject) => {
     const w = entry.worker;
 
+    const sendMessage = () => {
+      const globalMemory = Object.fromEntries(GLOBAL_MEMORY.entries());
+      const transferList = getTransferables(props);
+      w.postMessage({ props, globalMemory }, transferList);
+    };
+
     const onMsg = (e: MessageEvent) => {
-      cleanup();
       const { type, result, error } = e.data;
+
+      if (type === "ready") {
+        entry!.initialized = true;
+        sendMessage();
+        return;
+      }
+
+      cleanup();
       if (type === "error") reject(error);
       else resolve(result);
     };
@@ -209,10 +225,11 @@ globalThis.__worker_wrapper__ = async (
     w.addEventListener("message", onMsg);
     w.addEventListener("error", onError);
 
-    const globalMemory = Object.fromEntries(GLOBAL_MEMORY.entries());
-    const transferList = getTransferables(props);
-
-    w.postMessage({ props, globalMemory }, transferList);
+    if (entry!.initialized) {
+      // Reused worker — already past module init, safe to send immediately
+      sendMessage();
+    }
+    // else: wait for the 'ready' signal from the worker
   });
 };
 
