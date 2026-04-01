@@ -65,10 +65,15 @@ self.onmessage = async ({ data }) => {
   const hydratedProps = hydrate(data.props);
   try {
     const result = await (%FN%)(hydratedProps)();
-    const transfer = getTransferables(result);
+    let transfer = [];
+    try { transfer = getTransferables(result); } catch (_) {}
     postMessage({ type: 'success', result }, transfer);
   } catch (error) {
-    postMessage({ type: 'error', error });
+    try {
+      postMessage({ type: 'error', error });
+    } catch {
+      postMessage({ type: 'error', error: String(error) });
+    }
   }
 };
 postMessage({ type: 'ready' });`;
@@ -188,7 +193,12 @@ globalThis.__worker_wrapper__ = async (
     const sendMessage = () => {
       const globalMemory = Object.fromEntries(GLOBAL_MEMORY.entries());
       const transferList = getTransferables(props);
-      w.postMessage({ props, globalMemory }, transferList);
+      try {
+        w.postMessage({ props, globalMemory }, transferList);
+      } catch (err) {
+        cleanup();
+        reject(err);
+      }
     };
 
     const onMsg = (e: MessageEvent) => {
