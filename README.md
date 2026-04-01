@@ -8,23 +8,12 @@
 [![Node.js](https://img.shields.io/badge/Node.js-6DA55F?logo=node.js&logoColor=white)]()
 [![Deno](https://img.shields.io/badge/Deno-000?logo=deno&logoColor=fff)]()
 [![Bun](https://img.shields.io/badge/Bun-000?logo=bun&logoColor=fff)]()
-[![GitHub Repo stars](https://img.shields.io/github/stars/W4G1/experimental-threads?logo=github&label=Star&labelColor=rgb(26%2C%2030%2C%2035)&color=rgb(13%2C%2017%2C%2023))](https://github.com/W4G1/experimental-threads)
 
 </div>
 
-<br/>
+`experimental-threads` is a concurrency library for server-side JavaScript and TypeScript (Node.js, Deno, Bun). It runs **inline closures in Web Workers** — no separate entry files, no manual message passing. Variables from the enclosing scope are captured automatically via static AST analysis and transferred into the worker context.
 
-`experimental-threads` is a highly experimental concurrency library for server-side JavaScript and TypeScript (Node.js, Deno, Bun). It enables the execution of inline closures within isolated Web Workers by combining static AST analysis, lexical scope capture, and shared memory hydration.
-
-By abstracting away standard Web Worker message passing and the need for separate entry files, this library provides an API structurally similar to thread spawning in systems languages like Rust or Go.
-
-## Features
-
-* **Lexical Scope Capture:** Automatically identifies, serializes, and transfers variables captured by an inline closure to the worker context.
-* **Zero-Copy Transfers:** Automatically transfers ownership of `Transferable` types (e.g., `ArrayBuffer`, `MessagePort`) rather than copying them.
-* **Isolate State Synchronization:** The `Global<T>` primitive ensures `SharedArrayBuffer` references maintain referential equality across separate V8 isolates.
-* **Thread-Safe Synchronization Primitives:** Includes `Mutex` and `Semaphore` implementations backed by `Atomics.wait` and `Atomics.notify`. Supports Explicit Resource Management (`using` declarations) for RAII-style lock acquisition and release.
-* **Worker Pooling:** Automatically manages active worker lifecycles, pooling, and idle timeouts.
+The API is structurally similar to thread spawning in systems languages like Rust or Go.
 
 ## Installation
 
@@ -34,11 +23,9 @@ npm install experimental-threads
 
 ## Usage
 
-### Spawning Threads
+### Spawning a thread
 
-The `spawn` function takes a closure and executes it in a separate thread. Variables from the surrounding lexical scope are automatically captured and passed to the worker.
-
-*Note: The `eval` wrapper is strictly required to capture the local environment. See the Architecture section below for details.*
+`spawn` captures the closure's free variables and returns a script string. Wrapping it in `eval()` bridges the local scope at the call site, serializes the captured variables, and runs the closure in a worker.
 
 ```typescript
 import { spawn } from "experimental-threads";
@@ -47,107 +34,131 @@ import * as bcrypt from "bcrypt";
 const userRequest = { username: "admin", password: "correct_horse_battery_staple" };
 const saltRounds = 12;
 
-const result = await eval(spawn(async () => {
-  // 'userRequest' and 'saltRounds' are captured from the parent scope and cloned into the worker
-  console.log(userRequest);
-
-  const hash = await bcrypt.hash(userRequest.password, saltRounds);
-
-  return hash;
+// 'userRequest' and 'saltRounds' are captured from the enclosing scope,
+// cloned, and transferred to the worker automatically.
+const hash = await eval(spawn(async () => {
+  return await bcrypt.hash(userRequest.password, saltRounds);
 }));
 
-console.log(result); // "$2b$12$..."
+console.log(hash); // "$2b$12$..."
 ```
 
-### Shared Memory and Mutexes
+> **Note:** The `eval()` wrapper is required — it is what bridges the call site's lexical scope into the generated script string. See [Architecture](#architecture) for details.
 
-Because Web Workers operate in isolated contexts, module-level variables are instantiated once per worker. The `Global<T>` wrapper resolves this by synchronizing `SharedArrayBuffer` memory across boundaries.
+### Shared memory and mutexes
+
+Web Workers run in separate V8 isolates, so module-level objects (including locks) are independent in each worker. `Global<T>` fixes this by pinning a `SharedArrayBuffer`-backed resource to its source location, ensuring all isolates share the same underlying memory.
 
 ```typescript
 import { Global, Mutex, spawn } from "experimental-threads";
 
-// Define a globally synchronized Mutex wrapping a SharedArrayBuffer
+// This Mutex wraps a SharedArrayBuffer. Because it is Global<T>, every
+// worker that imports this module gets the same underlying memory buffer.
 const sharedLock = new Global(new Mutex(new SharedArrayBuffer(4)));
 
+// Main thread: acquire the lock and write an initial value
 {
   using guard = await sharedLock.value.lock();
-  const data = new Int32Array(guard.value);
-  data[0] = 1;
+  new Int32Array(guard.value)[0] = 1;
 }
 
-// Spawn a worker
 await eval(spawn(async () => {
-  // Block (wait) until the lock is available
   using guard = await sharedLock.value.lock();
-  const data = new Int32Array(guard.value);
+  const view = new Int32Array(guard.value);
 
-  data[0] = 2;
+  console.log(view[0]); // 1
+  view[0] = 2;
 
-  // Unlock manually because we don't exit this thread yet
-  guard.unlock();
-
-  // Threads can spawn nested sub-threads as well
+  // Workers can spawn nested sub-threads
   await eval(spawn(async () => {
     using guard = await sharedLock.value.lock();
-    const data = new Int32Array(guard.value);
-
-    data[0] = 3;
+    new Int32Array(guard.value)[0] = 3;
   }));
 }));
 
 {
   using guard = await sharedLock.value.lock();
-  const data = new Int32Array(guard.value);
-  console.log(data[0]); // Outputs: 3
+  console.log(new Int32Array(guard.value)[0]); // 3
 }
 ```
 
+`MutexGuard` implements `Symbol.dispose`, so the `using` keyword releases the lock automatically at scope exit. You can also call `guard.unlock()` explicitly.
+
+### Semaphore
+
+`Semaphore` controls access to a resource with a fixed number of permits.
+
+```typescript
+import { Semaphore } from "experimental-threads";
+
+const sem = new Semaphore(3); // 3 concurrent permits
+
+{
+  using _permit = await sem.acquire();
+  // up to 3 holders at a time
+}
+// permit released automatically
+
+sem.release(1); // or release manually
+```
+
+## API
+
+### `spawn<T>(fn: () => T): WorkerScript<T>`
+
+Statically analyzes the closure, identifies its free variables, and returns a script string encoding the worker bootstrap. Must be called with `eval()` to capture runtime values.
+
+### `shutdown(): void`
+
+Terminates all pooled workers and clears internal caches. Required for clean process exit (e.g., at the end of tests).
+
+### `Global<T extends SharedStruct | SharedArrayBuffer>`
+
+Wraps a `SharedArrayBuffer`-backed value and gives it a stable identity across isolates derived from its source location (file + line + column). Instantiating `Global<T>` at the same call site in any worker will point to the same underlying memory as the main thread.
+
+### `Mutex<T>`
+
+An async mutual exclusion lock backed by `Atomics.waitAsync`.
+
+- `await mutex.lock(): Promise<MutexGuard<T>>` — acquires the lock
+- `guard.unlock()` / `guard[Symbol.dispose]()` — releases it
+- Supports `using guard = await mutex.lock()` for automatic release
+
+### `Semaphore`
+
+An async counting semaphore backed by `Atomics.waitAsync`.
+
+- `await semaphore.acquire(amount?: number)` — decrements permits, blocks if insufficient; returns a disposable guard
+- `semaphore.release(amount?: number)` — restores permits and wakes waiters
+
 ## Architecture
 
-### Lexical Scope Resolution
+### Lexical scope capture
 
-JavaScript does not provide a built-in way to reflectively inspect the variables captured by a closure. To serialize a closure and send it to a Web Worker, `experimental-threads` must extract both the variable names and their runtime values using a multi-step process:
+JavaScript has no built-in way to inspect the variables captured by a closure. `experimental-threads` extracts them at the call site:
 
-1. **Static Analysis:** `spawn(fn)` resolves its own call site via the V8 stack trace. It reads the source file from disk and parses it into an Abstract Syntax Tree (AST) using the TypeScript Compiler API.
-2. **Identifier Resolution:** The AST is traversed to locate the closure and identify its *free variables* (variables referenced inside the function but defined outside of it).
-3. **Code Generation:** The library generates a standalone worker entry script, rewriting relative import paths to ensure they resolve correctly from the generated `.workers` directory.
-4. **Scope Bridging:** `spawn()` returns a generated code snippet. Evaluating this snippet with `eval()` in the caller's scope captures the runtime values of the free variables, allowing the library to serialize them and initialize the worker.
+1. **Call site resolution** — `spawn()` reads the V8 stack trace to find its own call site (file, line, column).
+2. **AST analysis** — the source file is parsed with the TypeScript Compiler API. The AST is traversed to locate the `spawn()` call and identify its closure's *free variables* — identifiers referenced inside the function but defined outside it.
+3. **Code generation** — a standalone worker entry script is produced from the caller's source, with relative import paths rewritten to absolute `file://` URLs so they resolve from the `.workers/` directory.
+4. **Scope bridging** — `spawn()` returns a code snippet of the form `__worker_wrapper__({a, b, c}, ...)`. Evaluating this with `eval()` in the caller's scope captures the runtime values of the free variables. Those values are structured-cloned (with `Transferable` objects zero-copy transferred) and sent to the worker.
 
-### Shared Memory Hydration
+### Shared memory hydration
 
-Because Web Workers run in separate V8 isolates, a module-level `const lock = new Mutex()` creates a completely new, independent lock in every worker. 
+Because each V8 isolate runs module code independently, a `new Mutex()` in a worker creates a fresh, unrelated lock. `Global<T>` solves this with location-based identity:
 
-The `Global<T>` wrapper solves this by guaranteeing that a shared resource points to the exact same memory address across all isolates:
-* When a `Global<T>` is instantiated, it generates a deterministic ID based on its exact call site (file path, line number, and column).
-* The main thread maps this ID to the underlying `SharedArrayBuffer`.
-* When a worker initializes and executes the same module code, the `Global<T>` constructor intercepts the allocation. It queries a memory map transmitted during the worker's bootstrap phase and hydrates its internal state with the parent thread's memory buffer.
+- On the **main thread**, `new Global(value)` registers the underlying `SharedArrayBuffer` under a key derived from the call site.
+- On a **worker**, the same constructor intercepts the allocation. During bootstrap, the main thread sends its full memory registry to the worker. The `Global<T>` constructor looks up its key and hydrates from the parent's buffer rather than allocating a new one.
 
-## API Reference
+This guarantees that `sharedLock.value` in a worker is backed by the same `SharedArrayBuffer` as in the main thread.
 
-### Core
+### Worker pooling
 
-* **`spawn<T>(fn: () => T): WorkerScript<T>`**
-  Analyzes the provided closure and returns a script string. Must be executed via `eval()`.
-* **`shutdown(): void`**
-  Terminates all active workers and clears memory caches. Required for graceful process termination.
-
-### Synchronization
-
-* **`Global<T>`**
-  A wrapper for `SharedArrayBuffer` or `SharedStruct` types. Ensures the underlying memory block maintains referential equality across isolated worker contexts.
-* **`Mutex<T>`**
-  An asynchronous mutual exclusion lock. 
-  * `await mutex.lock()` returns a `MutexGuard<T>`.
-  * Implements `[Symbol.dispose]` for RAII-style unlocking.
-* **`Semaphore`**
-  An asynchronous signaling primitive for controlling access to a shared resource.
-  * `await semaphore.acquire(amount)`
-  * `semaphore.release(amount)`
+Workers are pooled by a signature derived from the call site and the set of captured variable names. An idle worker is reused for subsequent identical calls. Workers that remain idle for 30 seconds are terminated. A warning is logged if the total active worker count exceeds 4× hardware concurrency.
 
 ## Limitations
 
-* **`eval` Requirement:** The API mandates the use of `eval()` to bridge the lexical scope. This restricts the library's use to backend environments where the source code is known and trusted. It must never be used to evaluate user-provided input.
+- **`eval` is required.** The scope-bridging mechanism depends on evaluating the generated script in the caller's lexical scope. This restricts usage to trusted, server-side code. Never pass user-provided input through `spawn` or `eval`.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE).
