@@ -1,10 +1,6 @@
 // @ts-nocheck: polyfill file for node
 
-import {
-  isMainThread,
-  parentPort,
-  Worker as NodeWorker,
-} from "node:worker_threads";
+import { isMainThread, parentPort, Worker as NodeWorker } from "node:worker_threads";
 
 globalThis.self = globalThis;
 
@@ -17,52 +13,49 @@ globalThis.ErrorEvent = class ErrorEvent extends Event {
 
   constructor(type: string, init?: ErrorEventInit) {
     super(type, init);
-    this.message = init?.message || "";
-    this.filename = init?.filename || "";
-    this.lineno = init?.lineno || 0;
-    this.colno = init?.colno || 0;
-    this.error = init?.error || null;
+    this.message = init?.message ?? "";
+    this.filename = init?.filename ?? "";
+    this.lineno = init?.lineno ?? 0;
+    this.colno = init?.colno ?? 0;
+    this.error = init?.error ?? null;
   }
 };
 
 if (isMainThread) {
   globalThis.Worker = class Worker extends EventTarget {
-    private _worker: any;
-    private _onMessage: (data: any) => void;
-    private _onError: (error: Error) => void;
-    private _onExit: (code: number) => void;
+    public onmessage: ((this: Worker, ev: MessageEvent) => any) | null = null;
+    public onerror: ((this: Worker, ev: ErrorEvent) => any) | null = null;
+
+    private readonly _worker: any;
+    private readonly _onMessage: (data: any) => void;
+    private readonly _onError: (error: Error) => void;
+    private readonly _onExit: (code: number) => void;
 
     constructor(scriptURL: string | URL, options?: WorkerOptions) {
       super();
-      const urlStr = scriptURL.toString();
-      const finalPath = urlStr.startsWith("file://") ? new URL(urlStr) : urlStr;
-
-      this._worker = new NodeWorker(finalPath, { ...options });
+      this._worker = new NodeWorker(
+        scriptURL.toString().startsWith("file://") ? new URL(scriptURL.toString()) : scriptURL.toString(),
+        { ...options },
+      );
 
       this._onMessage = (data: any) => {
         const event = new MessageEvent("message", { data });
         this.dispatchEvent(event);
-        if (this.onmessage) this.onmessage(event);
+        this.onmessage?.(event);
       };
 
       this._onError = (error: Error) => {
-        const event = new ErrorEvent("error", {
-          error,
-          message: error.message,
-        });
+        const event = new ErrorEvent("error", { error, message: error.message });
         this.dispatchEvent(event);
-        if (this.onerror) this.onerror(event);
+        this.onerror?.(event);
       };
 
       this._onExit = (code: number) => {
         if (code !== 0) {
           const err = new Error(`Worker stopped with exit code ${code}`);
-          const event = new ErrorEvent("error", {
-            error: err,
-            message: err.message,
-          });
+          const event = new ErrorEvent("error", { error: err, message: err.message });
           this.dispatchEvent(event);
-          if (this.onerror) this.onerror(event);
+          this.onerror?.(event);
         }
       };
 
@@ -81,17 +74,14 @@ if (isMainThread) {
       this._worker.off("exit", this._onExit);
       this._worker.terminate();
     }
-
-    public onmessage: ((this: Worker, ev: MessageEvent) => any) | null = null;
-    public onerror: ((this: Worker, ev: ErrorEvent) => any) | null = null;
   };
 }
 
 if (!isMainThread && parentPort) {
-  // We use Symbol.hasInstance so that "self instanceof WorkerGlobalScope" returns true
-  // even though we can't easily change the prototype of the global Node object.
+  // Symbol.hasInstance makes `self instanceof WorkerGlobalScope` return true
+  // without changing the prototype of the Node.js global object.
   class WorkerGlobalScope extends EventTarget {
-    static [Symbol.hasInstance](instance) {
+    static [Symbol.hasInstance](instance: unknown) {
       return instance === globalThis;
     }
   }
@@ -103,21 +93,16 @@ if (!isMainThread && parentPort) {
   };
 
   let currentHandler = globalThis.onmessage;
-
-  parentPort.on("message", (data) => {
-    const event = new MessageEvent("message", { data });
-
-    if (typeof globalThis.onmessage === "function") {
-      globalThis.onmessage(event);
-    }
-  });
-
   Object.defineProperty(globalThis, "onmessage", {
     get: () => currentHandler,
-    set: (fn) => {
-      currentHandler = fn;
-    },
+    set: (fn) => { currentHandler = fn; },
     configurable: true,
     enumerable: true,
+  });
+
+  parentPort.on("message", (data) => {
+    if (typeof globalThis.onmessage === "function") {
+      globalThis.onmessage(new MessageEvent("message", { data }));
+    }
   });
 }

@@ -23,21 +23,13 @@ const WORKER_WARNING_THRESHOLD = navigator.hardwareConcurrency * 4;
 declare global {
   function eval<T>(script: WorkerScript<T>): T;
   function __worker_wrapper__(
-    props: any,
+    props: Record<string, unknown>,
     topLevelVars: string[],
     fnStr: string,
     url: string,
     baseCacheKey: string,
-  ): Promise<any>;
+  ): Promise<unknown>;
 }
-
-const FILE_CACHE = new Map<string, ts.SourceFile>();
-const SCOPE_ANALYSIS_CACHE = new Map<
-  string,
-  { locals: string[]; topLevels: string[] }
->();
-const PATCHED_SOURCE_CACHE = new Map<string, string>();
-const PATH_CACHE = new Map<string, string>();
 
 interface PoolEntry {
   worker: Worker;
@@ -47,25 +39,30 @@ interface PoolEntry {
   initialized: boolean;
 }
 
+const FILE_CACHE = new Map<string, ts.SourceFile>();
+const SCOPE_ANALYSIS_CACHE = new Map<
+  string,
+  { locals: string[]; topLevels: string[] }
+>();
+const PATCHED_SOURCE_CACHE = new Map<string, string>();
+const PATH_CACHE = new Map<string, string>();
 const WORKER_POOL = new Map<string, PoolEntry[]>();
 let TOTAL_ACTIVE_WORKERS = 0;
 
 const PRIMITIVES_URL = new URL("./primitives.ts", import.meta.url).href;
 const UTILS_URL = new URL("./utils.ts", import.meta.url).href;
-
 const WORKER_SPLIT_MARKER = "/* __INJECTED_WORKER_BOOTSTRAP__ */";
 
-const WORKER_BODY = `${WORKER_SPLIT_MARKER}
+const workerBody = (wrapper: string) =>
+  `${WORKER_SPLIT_MARKER}
 import { hydrate, hydrateGlobalMemory } from "${PRIMITIVES_URL}";
 import { getTransferables } from "${UTILS_URL}";
 self.onmessage = async ({ data }) => {
-  if (data.globalMemory) {
-    hydrateGlobalMemory(data.globalMemory);
-  }
+  if (data.globalMemory) hydrateGlobalMemory(data.globalMemory);
   const hydratedProps = hydrate(data.props);
   try {
-    const result = await (%FN%)(hydratedProps)();
-    let transfer = [];
+    const result = await (${wrapper})(hydratedProps as any)();
+    let transfer: Transferable[] = [];
     try { transfer = getTransferables(result); } catch (_) {}
     postMessage({ type: 'success', result }, transfer);
   } catch (error) {
@@ -82,9 +79,7 @@ export function spawn<T>(fn: () => T): WorkerScript<T> {
   const site = getCallSite(import.meta.url);
   const baseCacheKey = `${site.url}:${site.line}:${site.col}`;
 
-  if (!SCOPE_ANALYSIS_CACHE.has(baseCacheKey)) {
-    analyzeScope(site, baseCacheKey);
-  }
+  if (!SCOPE_ANALYSIS_CACHE.has(baseCacheKey)) analyzeScope(site, baseCacheKey);
 
   const { locals, topLevels } = SCOPE_ANALYSIS_CACHE.get(baseCacheKey)!;
   const allVars = [...locals, ...topLevels];
@@ -93,7 +88,7 @@ export function spawn<T>(fn: () => T): WorkerScript<T> {
     JSON.stringify(topLevels)
   }, ${
     JSON.stringify(fn.toString())
-  }, "${site.url}", "${baseCacheKey}")` as any;
+  }, "${site.url}", "${baseCacheKey}")` as WorkerScript<T>;
 }
 
 globalThis.__worker_wrapper__ = async (
@@ -103,17 +98,10 @@ globalThis.__worker_wrapper__ = async (
   url,
   baseCacheKey,
 ) => {
-  // Filter Props
   for (const name of topLevelCandidates) {
     if (name in props) {
       const val = props[name];
-
-      if (val instanceof Global) {
-        delete props[name];
-        continue;
-      }
-
-      if (!isStructuredClonable(val)) {
+      if (val instanceof Global || !isStructuredClonable(val)) {
         delete props[name];
       }
     }
@@ -123,10 +111,7 @@ globalThis.__worker_wrapper__ = async (
   const signatureKey = `${baseCacheKey}::${finalVars.join(",")}`;
 
   let pool = WORKER_POOL.get(signatureKey);
-  if (!pool) {
-    pool = [];
-    WORKER_POOL.set(signatureKey, pool);
-  }
+  if (!pool) WORKER_POOL.set(signatureKey, pool = []);
 
   let entry = pool.find((e) => !e.busy);
 
@@ -135,11 +120,8 @@ globalThis.__worker_wrapper__ = async (
 
     if (!filePath) {
       let rawCode = readFileSync(fileURLToPath(url), "utf-8");
-
       const splitIdx = rawCode.indexOf(WORKER_SPLIT_MARKER);
-      if (splitIdx > -1) {
-        rawCode = rawCode.substring(0, splitIdx);
-      }
+      if (splitIdx > -1) rawCode = rawCode.substring(0, splitIdx);
 
       let patchedCode = PATCHED_SOURCE_CACHE.get(url);
       if (!patchedCode) {
@@ -148,31 +130,23 @@ globalThis.__worker_wrapper__ = async (
       }
 
       const wrapper = `(({${finalVars.join(",")}}) => ${fnStr})`;
-      const finalWorkerCode = patchedCode +
-        WORKER_BODY.replace("%FN%", wrapper);
-
       const hash = createHash("md5").update(signatureKey).digest("hex");
       const workerDir = resolve(process.cwd(), ".workers");
 
-      if (!existsSync(workerDir)) {
-        mkdirSync(workerDir, { recursive: true });
-      }
+      if (!existsSync(workerDir)) mkdirSync(workerDir, { recursive: true });
 
       const fileExt = extname(fileURLToPath(url)) || ".js";
       filePath = join(workerDir, `${hash}${fileExt}`);
-      writeFileSync(filePath, finalWorkerCode);
+      writeFileSync(filePath, patchedCode + workerBody(wrapper));
       PATH_CACHE.set(signatureKey, filePath);
     }
 
-    TOTAL_ACTIVE_WORKERS++;
-    if (TOTAL_ACTIVE_WORKERS > WORKER_WARNING_THRESHOLD) {
+    if (++TOTAL_ACTIVE_WORKERS > WORKER_WARNING_THRESHOLD) {
       console.warn(`High worker count: ${TOTAL_ACTIVE_WORKERS}`);
     }
 
-    const fileUrl = pathToFileURL(filePath).href;
-
     entry = {
-      worker: new Worker(fileUrl, { type: "module" }),
+      worker: new Worker(pathToFileURL(filePath).href, { type: "module" }),
       busy: true,
       filePath,
       initialized: false,
@@ -201,15 +175,31 @@ globalThis.__worker_wrapper__ = async (
       }
     };
 
-    const onMsg = (e: MessageEvent) => {
-      const { type, result, error } = e.data;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      w.removeEventListener("message", onMsg);
+      w.removeEventListener("error", onError);
+      entry.busy = false;
+      entry.timer = setTimeout(() => {
+        w.terminate();
+        TOTAL_ACTIVE_WORKERS--;
+        const idx = pool!.indexOf(entry);
+        if (idx > -1) pool!.splice(idx, 1);
+      }, WORKER_IDLE_TIMEOUT_MS);
+    };
 
+    const onMsg = (e: MessageEvent) => {
+      const { type, result, error } = e.data as {
+        type: string;
+        result: unknown;
+        error: unknown;
+      };
       if (type === "ready") {
-        entry!.initialized = true;
+        entry.initialized = true;
         sendMessage();
         return;
       }
-
       cleanup();
       if (type === "error") reject(error);
       else resolve(result);
@@ -220,28 +210,10 @@ globalThis.__worker_wrapper__ = async (
       reject(e.error);
     };
 
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      w.removeEventListener("message", onMsg);
-      w.removeEventListener("error", onError);
-      entry!.busy = false;
-      entry!.timer = setTimeout(() => {
-        w.terminate();
-        TOTAL_ACTIVE_WORKERS--;
-        const idx = pool!.indexOf(entry!);
-        if (idx > -1) pool!.splice(idx, 1);
-      }, WORKER_IDLE_TIMEOUT_MS);
-    };
-
     w.addEventListener("message", onMsg);
     w.addEventListener("error", onError);
 
-    if (entry!.initialized) {
-      // Reused worker — already past module init, safe to send immediately
-      sendMessage();
-    }
-    // else: wait for the 'ready' signal from the worker
+    if (entry.initialized) sendMessage();
   });
 };
 
@@ -253,8 +225,7 @@ function analyzeScope(
   let file = FILE_CACHE.get(path);
 
   if (!file) {
-    const code = readFileSync(path, "utf-8");
-    file = ts.createSourceFile("x.ts", code, 99, true);
+    file = ts.createSourceFile("x.ts", readFileSync(path, "utf-8"), 99, true);
     FILE_CACHE.set(path, file);
   }
 
@@ -262,12 +233,15 @@ function analyzeScope(
   let fnNode: ts.FunctionLikeDeclaration | undefined;
 
   const findFn = (n: ts.Node) => {
+    if (fnNode) return;
     if (
       n.pos <= pos && n.end >= pos && ts.isCallExpression(n) &&
       n.expression.getText() === "spawn"
     ) {
       fnNode = n.arguments[0] as ts.FunctionLikeDeclaration;
-    } else ts.forEachChild(n, findFn);
+    } else {
+      ts.forEachChild(n, findFn);
+    }
   };
   findFn(file);
 
@@ -275,27 +249,23 @@ function analyzeScope(
   const topLevels = new Set<string>();
 
   if (fnNode) {
-    const isInternal = (n: ts.Node) => {
-      let p = n;
+    const isExternal = (n: ts.Node) => {
+      let p: ts.Node | undefined = n;
       while (p) {
-        if (p === fnNode) return true;
+        if (p === fnNode) return false;
         p = p.parent;
       }
-      return false;
+      return true;
     };
 
     const visit = (n: ts.Node) => {
       if (ts.isIdentifier(n) && isValidUsage(n)) {
         let curr: ts.Node | undefined = n.parent;
-
         while (curr) {
           if (defines(curr, n.text)) {
-            if (!isInternal(curr)) {
-              if (curr.kind === ts.SyntaxKind.SourceFile) {
-                topLevels.add(n.text);
-              } else {
-                locals.add(n.text);
-              }
+            if (isExternal(curr)) {
+              if (ts.isSourceFile(curr)) topLevels.add(n.text);
+              else locals.add(n.text);
             }
             break;
           }
@@ -313,7 +283,7 @@ function analyzeScope(
   });
 }
 
-function isValidUsage(n: ts.Node) {
+function isValidUsage(n: ts.Node): boolean {
   const p = n.parent;
   if (
     (ts.isPropertyAccessExpression(p) || ts.isPropertyAssignment(p)) &&
@@ -327,15 +297,15 @@ function isValidUsage(n: ts.Node) {
   return true;
 }
 
-function defines(n: any, name: string): boolean {
+function defines(n: ts.Node, name: string): boolean {
   if (ts.isFunctionLike(n)) {
     return n.parameters.some((p) => bindingHasName(p.name, name));
   }
 
-  if ((ts.isBlock(n) || n.kind === ts.SyntaxKind.SourceFile) && n.statements) {
-    return n.statements.some((s: any) => {
+  if (ts.isBlock(n) || ts.isSourceFile(n)) {
+    return n.statements.some((s) => {
       if (ts.isVariableStatement(s)) {
-        return s.declarationList.declarations.some((d: any) =>
+        return s.declarationList.declarations.some((d) =>
           bindingHasName(d.name, name)
         );
       }
@@ -344,16 +314,14 @@ function defines(n: any, name: string): boolean {
         s.name?.text === name
       ) return true;
       if (ts.isImportDeclaration(s) && s.importClause) {
-        const clause = s.importClause;
-        if (clause.name?.text === name) return true;
-        if (clause.namedBindings) {
-          if (ts.isNamedImports(clause.namedBindings)) {
-            return clause.namedBindings.elements.some((e) =>
-              e.name.text === name
-            );
+        const { name: importedName, namedBindings } = s.importClause;
+        if (importedName?.text === name) return true;
+        if (namedBindings) {
+          if (ts.isNamedImports(namedBindings)) {
+            return namedBindings.elements.some((e) => e.name.text === name);
           }
-          if (ts.isNamespaceImport(clause.namedBindings)) {
-            return clause.namedBindings.name.text === name;
+          if (ts.isNamespaceImport(namedBindings)) {
+            return namedBindings.name.text === name;
           }
         }
       }
@@ -365,9 +333,7 @@ function defines(n: any, name: string): boolean {
     ts.isForStatement(n) && n.initializer &&
     ts.isVariableDeclarationList(n.initializer)
   ) {
-    return n.initializer.declarations.some((d: any) =>
-      bindingHasName(d.name, name)
-    );
+    return n.initializer.declarations.some((d) => bindingHasName(d.name, name));
   }
 
   if (ts.isCatchClause(n) && n.variableDeclaration) {
@@ -378,26 +344,20 @@ function defines(n: any, name: string): boolean {
 }
 
 function bindingHasName(node: ts.BindingName, name: string): boolean {
-  if (ts.isIdentifier(node)) {
-    return node.text === name;
-  }
-
+  if (ts.isIdentifier(node)) return node.text === name;
   if (ts.isObjectBindingPattern(node)) {
     return node.elements.some((el) => bindingHasName(el.name, name));
   }
-
   if (ts.isArrayBindingPattern(node)) {
-    return node.elements.some((el) => {
-      if (!ts.isBindingElement(el)) return false;
-      return bindingHasName(el.name, name);
-    });
+    return node.elements.some((el) =>
+      ts.isBindingElement(el) && bindingHasName(el.name, name)
+    );
   }
-
   return false;
 }
 
 function patchImports(code: string, base: string) {
-  const r = (p: string) => /^\.\.?\//.test(p) ? new URL(p, base).href : p;
+  const resolve = (p: string) => /^\.\.?\//.test(p) ? new URL(p, base).href : p;
 
   const sourceFile = ts.createSourceFile(
     fileURLToPath(base),
@@ -406,24 +366,21 @@ function patchImports(code: string, base: string) {
     true,
   );
 
-  const t: ts.TransformerFactory<ts.SourceFile> = (c) => (n) => {
-    const v: ts.Visitor = (node) => {
+  const transformer: ts.TransformerFactory<ts.SourceFile> = (ctx) => (node) => {
+    const visitor: ts.Visitor = (n) => {
       if (
-        ts.isStringLiteral(node) && node.parent &&
-        (ts.isImportDeclaration(node.parent) ||
-          ts.isExportDeclaration(node.parent))
+        ts.isStringLiteral(n) && n.parent &&
+        (ts.isImportDeclaration(n.parent) || ts.isExportDeclaration(n.parent))
       ) {
-        return c.factory.createStringLiteral(r(node.text));
+        return ctx.factory.createStringLiteral(resolve(n.text));
       }
-      return ts.visitEachChild(node, v, c);
+      return ts.visitEachChild(n, visitor, ctx);
     };
-    return ts.visitNode(n, v) as ts.SourceFile;
+    return ts.visitNode(node, visitor) as ts.SourceFile;
   };
 
-  const result = ts.transform(sourceFile, [t]);
-  const printer = ts.createPrinter({ newLine: ts.NewLineKind.LineFeed });
-
-  return printer.printNode(
+  const result = ts.transform(sourceFile, [transformer]);
+  return ts.createPrinter({ newLine: ts.NewLineKind.LineFeed }).printNode(
     ts.EmitHint.SourceFile,
     result.transformed[0]!,
     sourceFile,
