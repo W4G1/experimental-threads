@@ -119,9 +119,13 @@ globalThis.__worker_wrapper__ = async (
     let filePath = PATH_CACHE.get(signatureKey);
 
     if (!filePath) {
+      const noCheckHeader = "// @ts-nocheck: auto-generated worker file\n";
+
       let rawCode = readFileSync(fileURLToPath(url), "utf-8");
       const splitIdx = rawCode.indexOf(WORKER_SPLIT_MARKER);
       if (splitIdx > -1) rawCode = rawCode.substring(0, splitIdx);
+      // Strip existing header to avoid doubling it in nested workers
+      if (rawCode.startsWith(noCheckHeader)) rawCode = rawCode.substring(noCheckHeader.length);
 
       let patchedCode = PATCHED_SOURCE_CACHE.get(url);
       if (!patchedCode) {
@@ -137,7 +141,7 @@ globalThis.__worker_wrapper__ = async (
 
       const fileExt = extname(fileURLToPath(url)) || ".js";
       filePath = join(workerDir, `${hash}${fileExt}`);
-      writeFileSync(filePath, patchedCode + workerBody(wrapper));
+      writeFileSync(filePath, noCheckHeader + patchedCode + workerBody(wrapper));
       PATH_CACHE.set(signatureKey, filePath);
     }
 
