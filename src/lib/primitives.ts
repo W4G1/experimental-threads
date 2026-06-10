@@ -16,33 +16,81 @@ export function hydrateGlobalMemory(map: Record<string, SharedArrayBuffer>) {
   }
 }
 
+const SITE_COUNTS = new Map<string, number>();
+
 export function getCallSiteId() {
   const site = getCallSite(import.meta.url);
-  return `${site.url}:${site.line}:${site.col}`;
+  // Inside a worker, the spawning module runs as a copy under .workers/.
+  // The copy's header tag maps call sites back to the original file so IDs
+  // match the ones registered by the main thread.
+  const src = (globalThis as any).__worker_source__;
+  const base = src && site.url === src.workerUrl
+    ? `${src.url}:${site.line - src.lineOffset}:${site.col}`
+    : `${site.url}:${site.line}:${site.col}`;
+  // Occurrence index keeps Globals created at the same site (helpers, loops)
+  // distinct, while module re-evaluation still yields matching IDs.
+  const count = SITE_COUNTS.get(base) ?? 0;
+  SITE_COUNTS.set(base, count + 1);
+  return `${base}#${count}`;
 }
 
-type Constructor<T> = new (buffer: SharedArrayBuffer, isHydrating?: boolean) => T;
+type Constructor<T> = new (
+  buffer: SharedArrayBuffer,
+  isHydrating?: boolean,
+) => T;
 const REGISTRY = new Map<string, Constructor<SharedStruct>>();
 
 export function register(name: string, cls: Constructor<SharedStruct>) {
   REGISTRY.set(name, cls);
 }
 
-export function hydrate(obj: unknown): unknown {
+export function hydrate(
+  obj: unknown,
+  seen = new Map<object, unknown>(),
+): unknown {
   if (!obj || typeof obj !== "object") return obj;
-  if (Array.isArray(obj)) return obj.map(hydrate);
+  if (seen.has(obj)) return seen.get(obj);
+
+  if (Array.isArray(obj)) {
+    seen.set(obj, obj);
+    for (let i = 0; i < obj.length; i++) obj[i] = hydrate(obj[i], seen);
+    return obj;
+  }
 
   const o = obj as Record<string, unknown>;
-  if (typeof o["__cls"] === "string" && REGISTRY.has(o["__cls"]) && o["state"]) {
+
+  // Global is not a SharedStruct: restore its prototype without running the
+  // constructor (which would derive a fresh call-site ID).
+  if (o["__cls"] === "Global" && "_inner" in o) {
+    const g = Object.create(Global.prototype) as Record<string, unknown>;
+    seen.set(obj, g);
+    g["id"] = o["id"];
+    g["_inner"] = hydrate(o["_inner"], seen);
+    return g;
+  }
+
+  if (
+    typeof o["__cls"] === "string" && REGISTRY.has(o["__cls"]) && o["state"]
+  ) {
     const Cls = REGISTRY.get(o["__cls"] as string)!;
-    const instance = new Cls((o["state"] as { buffer: SharedArrayBuffer }).buffer, true);
+    const instance = new Cls(
+      (o["state"] as { buffer: SharedArrayBuffer }).buffer,
+      true,
+    );
+    seen.set(obj, instance);
     for (const k in o) {
-      if (k !== "__cls" && k !== "state") (instance as unknown as Record<string, unknown>)[k] = hydrate(o[k]);
+      if (k !== "__cls" && k !== "state") {
+        (instance as unknown as Record<string, unknown>)[k] = hydrate(
+          o[k],
+          seen,
+        );
+      }
     }
     return instance;
   }
 
-  for (const k in o) o[k] = hydrate(o[k]);
+  seen.set(obj, obj);
+  for (const k in o) o[k] = hydrate(o[k], seen);
   return o;
 }
 
@@ -54,7 +102,8 @@ interface StructInternals {
   _data: SharedArrayBuffer | undefined;
   _replaceBuffer(buffer: SharedArrayBuffer): void;
 }
-const asInternals = (s: SharedStruct): StructInternals => s as unknown as StructInternals;
+const asInternals = (s: SharedStruct): StructInternals =>
+  s as unknown as StructInternals;
 
 export abstract class SharedStruct {
   protected state: Int32Array;
@@ -91,6 +140,7 @@ export abstract class SharedStruct {
  * guaranteeing referential equality across V8 isolates.
  */
 export class Global<T extends SharedStruct | SharedArrayBuffer> {
+  readonly __cls = "Global";
   private _inner: T;
   private readonly id: string;
 
@@ -107,18 +157,17 @@ export class Global<T extends SharedStruct | SharedArrayBuffer> {
   private _tryHydrate() {
     const stateKey = `${this.id}::state`;
     const dataKey = `${this.id}::data`;
-    const inner = this._inner instanceof SharedArrayBuffer ? null : asInternals(this._inner);
+    const inner = this._inner instanceof SharedArrayBuffer
+      ? null
+      : asInternals(this._inner);
     const stateBuffer = inner?.buffer ?? (this._inner as SharedArrayBuffer);
 
     if (IS_MAIN_THREAD) {
-      const existing = GLOBAL_MEMORY.get(stateKey);
-      if (existing) this._applyStateBuffer(existing);
-      else GLOBAL_MEMORY.set(stateKey, stateBuffer);
-
+      // Occurrence-indexed IDs are unique per construction, so register
+      // unconditionally.
+      GLOBAL_MEMORY.set(stateKey, stateBuffer);
       if (inner?._data instanceof SharedArrayBuffer) {
-        const existingData = GLOBAL_MEMORY.get(dataKey);
-        if (existingData) inner._data = existingData;
-        else GLOBAL_MEMORY.set(dataKey, inner._data);
+        GLOBAL_MEMORY.set(dataKey, inner._data);
       }
     } else {
       let ready = true;
@@ -165,7 +214,14 @@ export class Semaphore extends SharedStruct {
     while (true) {
       const current = Atomics.load(this.state, Semaphore.IDX);
       if (current >= amount) {
-        if (Atomics.compareExchange(this.state, Semaphore.IDX, current, current - amount) === current) {
+        if (
+          Atomics.compareExchange(
+            this.state,
+            Semaphore.IDX,
+            current,
+            current - amount,
+          ) === current
+        ) {
           return { [Symbol.dispose]: () => this.release(amount) };
         }
       } else {
@@ -226,7 +282,12 @@ export class Mutex<
   async lock(): Promise<MutexGuard<T>> {
     while (true) {
       if (
-        Atomics.compareExchange(this.state, Mutex.IDX, Mutex.UNLOCKED, Mutex.LOCKED) === Mutex.UNLOCKED
+        Atomics.compareExchange(
+          this.state,
+          Mutex.IDX,
+          Mutex.UNLOCKED,
+          Mutex.LOCKED,
+        ) === Mutex.UNLOCKED
       ) {
         return new MutexGuard(this._data, () => this._release());
       }
@@ -236,7 +297,14 @@ export class Mutex<
   }
 
   private _release() {
-    if (Atomics.compareExchange(this.state, Mutex.IDX, Mutex.LOCKED, Mutex.UNLOCKED) !== Mutex.LOCKED) {
+    if (
+      Atomics.compareExchange(
+        this.state,
+        Mutex.IDX,
+        Mutex.LOCKED,
+        Mutex.UNLOCKED,
+      ) !== Mutex.LOCKED
+    ) {
       throw new Error("Mutex is not locked");
     }
     Atomics.notify(this.state, Mutex.IDX, 1);

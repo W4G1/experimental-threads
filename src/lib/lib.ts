@@ -5,11 +5,7 @@ import { extname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import process from "node:process";
 import { Global, GLOBAL_MEMORY } from "./primitives.ts";
-import {
-  getCallSite,
-  getTransferables,
-  isStructuredClonable,
-} from "./utils.ts";
+import { getCallSite, isStructuredClonable } from "./utils.ts";
 
 export { Global, Mutex, type MutexGuard, Semaphore } from "./primitives.ts";
 
@@ -21,6 +17,7 @@ const WORKER_IDLE_TIMEOUT_MS = 1000 * 30;
 const WORKER_WARNING_THRESHOLD = navigator.hardwareConcurrency * 4;
 
 declare global {
+  // deno-lint-ignore no-shadow-restricted-names
   function eval<T>(script: WorkerScript<T>): T;
   function __worker_wrapper__(
     props: Record<string, unknown>,
@@ -35,8 +32,8 @@ interface PoolEntry {
   worker: Worker;
   busy: boolean;
   timer?: number;
-  filePath: string;
   initialized: boolean;
+  dead?: boolean;
 }
 
 const FILE_CACHE = new Map<string, ts.SourceFile>();
@@ -57,6 +54,11 @@ const workerBody = (wrapper: string) =>
   `${WORKER_SPLIT_MARKER}
 import { hydrate, hydrateGlobalMemory } from "${PRIMITIVES_URL}";
 import { getTransferables } from "${UTILS_URL}";
+const nativeClose = self.close?.bind(self);
+self.close = () => {
+  try { postMessage({ type: 'closed' }); } catch (_) { /* parent gone */ }
+  nativeClose?.();
+};
 self.onmessage = async ({ data }) => {
   if (data.globalMemory) hydrateGlobalMemory(data.globalMemory);
   const hydratedProps = hydrate(data.props);
@@ -73,6 +75,7 @@ self.onmessage = async ({ data }) => {
     }
   }
 };
+globalThis.__worker_ready__ = true;
 postMessage({ type: 'ready' });`;
 
 export function spawn<T>(fn: () => T): WorkerScript<T> {
@@ -91,13 +94,24 @@ export function spawn<T>(fn: () => T): WorkerScript<T> {
   }, "${site.url}", "${baseCacheKey}")` as WorkerScript<T>;
 }
 
-globalThis.__worker_wrapper__ = async (
+globalThis.__worker_wrapper__ = (
   props,
   topLevelCandidates,
   fnStr,
   url,
   baseCacheKey,
 ) => {
+  if (!isMainThread && !(globalThis as any).__worker_ready__) {
+    // A worker re-executes its source module's top level. Spawning there
+    // would recurse into new workers forever, so run the closure inline:
+    // later top-level code still sees a real result.
+    console.warn("spawn() at module top level runs inline inside workers");
+    const wrapper = new Function(
+      `return (({${Object.keys(props).join(",")}}) => ${fnStr});`,
+    )() as (p: Record<string, unknown>) => () => unknown;
+    return Promise.resolve().then(() => wrapper(props)());
+  }
+
   for (const name of topLevelCandidates) {
     if (name in props) {
       const val = props[name];
@@ -120,18 +134,33 @@ globalThis.__worker_wrapper__ = async (
 
     if (!filePath) {
       const noCheckHeader = "// @ts-nocheck: auto-generated worker file\n";
-
-      let rawCode = readFileSync(fileURLToPath(url), "utf-8");
-      const splitIdx = rawCode.indexOf(WORKER_SPLIT_MARKER);
-      if (splitIdx > -1) rawCode = rawCode.substring(0, splitIdx);
-      // Strip existing header to avoid doubling it in nested workers
-      if (rawCode.startsWith(noCheckHeader)) rawCode = rawCode.substring(noCheckHeader.length);
+      const sourceTagPrefix = "globalThis.__worker_source__ = ";
 
       let patchedCode = PATCHED_SOURCE_CACHE.get(url);
       if (!patchedCode) {
+        let rawCode = readFileSync(fileURLToPath(url), "utf-8");
+        const splitIdx = rawCode.indexOf(WORKER_SPLIT_MARKER);
+        if (splitIdx > -1) rawCode = rawCode.substring(0, splitIdx);
+        // Strip generated header lines to avoid doubling them in nested workers
+        if (rawCode.startsWith(noCheckHeader)) {
+          rawCode = rawCode.substring(noCheckHeader.length);
+        }
+        if (rawCode.startsWith(sourceTagPrefix)) {
+          rawCode = rawCode.substring(rawCode.indexOf("\n") + 1);
+        }
         patchedCode = patchImports(rawCode, url);
         PATCHED_SOURCE_CACHE.set(url, patchedCode);
       }
+
+      // Maps the copy's call sites back to the original module, so Global
+      // IDs derived inside the worker match the main thread's. The two
+      // header lines are the offset; patchImports preserves all other
+      // positions.
+      const src = (globalThis as any).__worker_source__;
+      const sourceUrl = src?.workerUrl === url ? src.url : url;
+      const sourceTag = `${sourceTagPrefix}{ workerUrl: import.meta.url, url: ${
+        JSON.stringify(sourceUrl)
+      }, lineOffset: 2 };\n`;
 
       const wrapper = `(({${finalVars.join(",")}}) => ${fnStr})`;
       const hash = createHash("md5").update(signatureKey).digest("hex");
@@ -141,7 +170,10 @@ globalThis.__worker_wrapper__ = async (
 
       const fileExt = extname(fileURLToPath(url)) || ".js";
       filePath = join(workerDir, `${hash}${fileExt}`);
-      writeFileSync(filePath, noCheckHeader + patchedCode + workerBody(wrapper));
+      writeFileSync(
+        filePath,
+        noCheckHeader + sourceTag + patchedCode + workerBody(wrapper),
+      );
       PATH_CACHE.set(signatureKey, filePath);
     }
 
@@ -149,13 +181,23 @@ globalThis.__worker_wrapper__ = async (
       console.warn(`High worker count: ${TOTAL_ACTIVE_WORKERS}`);
     }
 
-    entry = {
+    const created: PoolEntry = {
       worker: new Worker(pathToFileURL(filePath).href, { type: "module" }),
       busy: true,
-      filePath,
       initialized: false,
     };
-    pool.push(entry);
+    // Workers can die outside a task (uncaught errors, self.close()). These
+    // listeners outlive individual tasks so a dead worker is always evicted
+    // instead of being handed the next task.
+    created.worker.addEventListener("error", (e) => {
+      e.preventDefault();
+      evict(pool!, created);
+    });
+    created.worker.addEventListener("message", (e) => {
+      if ((e as MessageEvent).data?.type === "closed") evict(pool!, created);
+    });
+    pool.push(created);
+    entry = created;
   } else {
     if (entry.timer) {
       clearTimeout(entry.timer);
@@ -170,9 +212,10 @@ globalThis.__worker_wrapper__ = async (
 
     const sendMessage = () => {
       const globalMemory = Object.fromEntries(GLOBAL_MEMORY.entries());
-      const transferList = getTransferables(props);
       try {
-        w.postMessage({ props, globalMemory }, transferList);
+        // Captured props are cloned, never transferred: transferring would
+        // detach buffers still owned by the calling thread.
+        w.postMessage({ props, globalMemory });
       } catch (err) {
         cleanup();
         reject(err);
@@ -184,13 +227,12 @@ globalThis.__worker_wrapper__ = async (
       cleaned = true;
       w.removeEventListener("message", onMsg);
       w.removeEventListener("error", onError);
+      if (entry.dead) return;
       entry.busy = false;
-      entry.timer = setTimeout(() => {
-        w.terminate();
-        TOTAL_ACTIVE_WORKERS--;
-        const idx = pool!.indexOf(entry);
-        if (idx > -1) pool!.splice(idx, 1);
-      }, WORKER_IDLE_TIMEOUT_MS);
+      entry.timer = setTimeout(
+        () => evict(pool!, entry),
+        WORKER_IDLE_TIMEOUT_MS,
+      );
     };
 
     const onMsg = (e: MessageEvent) => {
@@ -205,13 +247,15 @@ globalThis.__worker_wrapper__ = async (
         return;
       }
       cleanup();
-      if (type === "error") reject(error);
+      if (type === "closed") {
+        reject(new Error("Worker closed before completing the task"));
+      } else if (type === "error") reject(error);
       else resolve(result);
     };
 
     const onError = (e: ErrorEvent) => {
       cleanup();
-      reject(e.error);
+      reject(e.error ?? new Error(e.message));
     };
 
     w.addEventListener("message", onMsg);
@@ -220,6 +264,16 @@ globalThis.__worker_wrapper__ = async (
     if (entry.initialized) sendMessage();
   });
 };
+
+function evict(pool: PoolEntry[], entry: PoolEntry) {
+  if (entry.dead) return;
+  entry.dead = true;
+  if (entry.timer) clearTimeout(entry.timer);
+  const idx = pool.indexOf(entry);
+  if (idx > -1) pool.splice(idx, 1);
+  entry.worker.terminate();
+  TOTAL_ACTIVE_WORKERS--;
+}
 
 function analyzeScope(
   site: { url: string; line: number; col: number },
@@ -298,6 +352,17 @@ function isValidUsage(n: ts.Node): boolean {
       ts.isBindingElement(p)) && p.name === n
   ) return false;
   if (ts.isImportSpecifier(p) && p.propertyName === n) return false;
+
+  // Identifiers inside erased type positions don't exist at runtime.
+  // `extends` heritage clauses are the exception: they are value references
+  // even though TS classifies them as type nodes.
+  for (let a: ts.Node | undefined = p; a; a = a.parent) {
+    if (ts.isExpressionWithTypeArguments(a)) {
+      return ts.isHeritageClause(a.parent) &&
+        a.parent.token === ts.SyntaxKind.ExtendsKeyword;
+    }
+    if (ts.isTypeNode(a)) return false;
+  }
   return true;
 }
 
@@ -306,7 +371,10 @@ function defines(n: ts.Node, name: string): boolean {
     return n.parameters.some((p) => bindingHasName(p.name, name));
   }
 
-  if (ts.isBlock(n) || ts.isSourceFile(n)) {
+  if (
+    ts.isBlock(n) || ts.isSourceFile(n) || ts.isCaseClause(n) ||
+    ts.isDefaultClause(n)
+  ) {
     return n.statements.some((s) => {
       if (ts.isVariableStatement(s)) {
         return s.declarationList.declarations.some((d) =>
@@ -334,8 +402,9 @@ function defines(n: ts.Node, name: string): boolean {
   }
 
   if (
-    ts.isForStatement(n) && n.initializer &&
-    ts.isVariableDeclarationList(n.initializer)
+    (ts.isForStatement(n) || ts.isForOfStatement(n) ||
+      ts.isForInStatement(n)) &&
+    n.initializer && ts.isVariableDeclarationList(n.initializer)
   ) {
     return n.initializer.declarations.some((d) => bindingHasName(d.name, name));
   }
@@ -360,43 +429,38 @@ function bindingHasName(node: ts.BindingName, name: string): boolean {
   return false;
 }
 
+// Rewrites relative import/export specifiers to absolute URLs by replacing
+// the literal spans in the original text. Unlike re-printing the AST, this
+// preserves every line and column, which Global call-site IDs depend on.
 function patchImports(code: string, base: string) {
-  const resolve = (p: string) => /^\.\.?\//.test(p) ? new URL(p, base).href : p;
+  const file = ts.createSourceFile("x.ts", code, ts.ScriptTarget.ESNext, true);
+  const edits: { start: number; end: number; text: string }[] = [];
 
-  const sourceFile = ts.createSourceFile(
-    fileURLToPath(base),
-    code,
-    ts.ScriptTarget.ESNext,
-    true,
-  );
-
-  const transformer: ts.TransformerFactory<ts.SourceFile> = (ctx) => (node) => {
-    const visitor: ts.Visitor = (n) => {
-      if (
-        ts.isStringLiteral(n) && n.parent &&
-        (ts.isImportDeclaration(n.parent) || ts.isExportDeclaration(n.parent))
-      ) {
-        return ctx.factory.createStringLiteral(resolve(n.text));
+  const visit = (n: ts.Node) => {
+    if (ts.isImportDeclaration(n) || ts.isExportDeclaration(n)) {
+      const spec = n.moduleSpecifier;
+      if (spec && ts.isStringLiteral(spec) && /^\.\.?\//.test(spec.text)) {
+        edits.push({
+          start: spec.getStart(file) + 1,
+          end: spec.end - 1,
+          text: new URL(spec.text, base).href,
+        });
       }
-      return ts.visitEachChild(n, visitor, ctx);
-    };
-    return ts.visitNode(node, visitor) as ts.SourceFile;
+    } else {
+      ts.forEachChild(n, visit);
+    }
   };
+  visit(file);
 
-  const result = ts.transform(sourceFile, [transformer]);
-  return ts.createPrinter({ newLine: ts.NewLineKind.LineFeed }).printNode(
-    ts.EmitHint.SourceFile,
-    result.transformed[0]!,
-    sourceFile,
-  );
+  for (const e of edits.reverse()) {
+    code = code.slice(0, e.start) + e.text + code.slice(e.end);
+  }
+  return code;
 }
 
 export function shutdown() {
   for (const pool of WORKER_POOL.values()) {
-    for (const entry of pool) {
-      if (entry.timer) clearTimeout(entry.timer);
-      entry.worker.terminate();
-    }
+    for (const entry of [...pool]) evict(pool, entry);
   }
   WORKER_POOL.clear();
   TOTAL_ACTIVE_WORKERS = 0;

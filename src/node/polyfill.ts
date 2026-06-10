@@ -1,6 +1,11 @@
 // @ts-nocheck: polyfill file for node
 
-import { isMainThread, parentPort, Worker as NodeWorker } from "node:worker_threads";
+import {
+  isMainThread,
+  parentPort,
+  Worker as NodeWorker,
+} from "node:worker_threads";
+import process from "node:process";
 
 globalThis.self = globalThis;
 
@@ -34,7 +39,9 @@ if (isMainThread) {
     constructor(scriptURL: string | URL, options?: WorkerOptions) {
       super();
       this._worker = new NodeWorker(
-        scriptURL.toString().startsWith("file://") ? new URL(scriptURL.toString()) : scriptURL.toString(),
+        scriptURL.toString().startsWith("file://")
+          ? new URL(scriptURL.toString())
+          : scriptURL.toString(),
         { ...options },
       );
 
@@ -45,7 +52,10 @@ if (isMainThread) {
       };
 
       this._onError = (error: Error) => {
-        const event = new ErrorEvent("error", { error, message: error.message });
+        const event = new ErrorEvent("error", {
+          error,
+          message: error.message,
+        });
         this.dispatchEvent(event);
         this.onerror?.(event);
       };
@@ -53,7 +63,10 @@ if (isMainThread) {
       this._onExit = (code: number) => {
         if (code !== 0) {
           const err = new Error(`Worker stopped with exit code ${code}`);
-          const event = new ErrorEvent("error", { error: err, message: err.message });
+          const event = new ErrorEvent("error", {
+            error: err,
+            message: err.message,
+          });
           this.dispatchEvent(event);
           this.onerror?.(event);
         }
@@ -88,6 +101,8 @@ if (!isMainThread && parentPort) {
 
   globalThis.WorkerGlobalScope = WorkerGlobalScope;
 
+  globalThis.close = () => process.exit(0);
+
   globalThis.postMessage = (message: any, transfer?: Transferable[]) => {
     parentPort.postMessage(message, transfer);
   };
@@ -95,7 +110,9 @@ if (!isMainThread && parentPort) {
   let currentHandler = globalThis.onmessage;
   Object.defineProperty(globalThis, "onmessage", {
     get: () => currentHandler,
-    set: (fn) => { currentHandler = fn; },
+    set: (fn) => {
+      currentHandler = fn;
+    },
     configurable: true,
     enumerable: true,
   });

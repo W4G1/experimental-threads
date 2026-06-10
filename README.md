@@ -35,7 +35,7 @@ const userRequest = { username: "admin", password: "correct_horse_battery_staple
 const saltRounds = 12;
 
 // 'userRequest' and 'saltRounds' are captured from the enclosing scope,
-// cloned, and transferred to the worker automatically.
+// cloned into the worker automatically (never transferred/detached).
 const hash = await eval(spawn(async () => {
   return await bcrypt.hash(userRequest.password, saltRounds);
 }));

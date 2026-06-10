@@ -24,7 +24,9 @@ Atomics.waitAsync = function (
 
   const wrappedPromise = (async () => {
     let active = true;
-    const keepAlive = () => { if (active) setImmediate(keepAlive); };
+    const keepAlive = () => {
+      if (active) setImmediate(keepAlive);
+    };
     keepAlive();
     try {
       return await result.value;
