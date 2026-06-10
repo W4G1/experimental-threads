@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert";
 import { delay } from "@std/async";
 import { shutdown, spawn } from "experimental-threads";
-import { sharedMutex } from "./shared.ts";
+import { sharedMutex } from "./nested-worker-mutex-locking-shared.ts";
 
 Deno.test("Nested Worker Mutex Locking", async () => {
   try {

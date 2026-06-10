@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert";
 import { delay } from "@std/async";
 import { shutdown, spawn } from "experimental-threads";
-import { getRaw, rawMutex, setRaw } from "./shared.ts";
+import { getRaw, rawMutex, setRaw } from "./nested-worker-shared.ts";
 
 Deno.test("Nested Raw Mutex Serialization", async () => {
   try {

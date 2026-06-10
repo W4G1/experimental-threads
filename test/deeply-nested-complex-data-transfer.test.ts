@@ -57,7 +57,7 @@ Deno.test("Deeply Nested Complex Data Transfer", async () => {
       view1[0] = 200;
 
       // Spawn W2 (nested)
-      return await eval(spawn(async () => {
+      return await eval(spawn(() => {
         // W2 captures 'complexPayload' from W1's scope,
         // effectively testing a clone-of-a-clone.
 
@@ -75,7 +75,7 @@ Deno.test("Deeply Nested Complex Data Transfer", async () => {
         if (complexPayload.arr.length !== 4) {
           throw new Error("W2: Array length fail");
         }
-        // @ts-ignore
+        // @ts-ignore: arr[3] is a union member without 'nestedInArray'
         if (complexPayload.arr[3].nestedInArray !== true) {
           throw new Error("W2: Deep obj fail");
         }
