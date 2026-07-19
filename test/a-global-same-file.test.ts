@@ -17,7 +17,7 @@ Deno.test("Global declared in spawning file is shared with worker", async () => 
 
     if (seen !== 42) {
       throw new Error(
-        `BUG CONFIRMED: worker saw ${seen}, expected 42 — memory not shared`,
+        `BUG CONFIRMED: worker saw ${seen}, expected 42, memory not shared`,
       );
     }
   } finally {

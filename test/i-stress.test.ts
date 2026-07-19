@@ -29,7 +29,7 @@ Deno.test({
       const total = new Int32Array(guard.value)[0];
       if (total !== WORKERS * ITERS) {
         throw new Error(
-          `BUG: lost updates — got ${total}, expected ${WORKERS * ITERS}`,
+          `BUG: lost updates, got ${total}, expected ${WORKERS * ITERS}`,
         );
       }
       console.log(`OK: ${total} increments, no lost updates`);

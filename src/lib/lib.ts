@@ -7,7 +7,19 @@ import process from "node:process";
 import { Global, GLOBAL_MEMORY } from "./primitives.ts";
 import { getCallSite, isStructuredClonable } from "./utils.ts";
 
-export { Global, Mutex, type MutexGuard, Semaphore } from "./primitives.ts";
+export {
+  Barrier,
+  Channel,
+  Condvar,
+  Global,
+  Mutex,
+  type MutexGuard,
+  Once,
+  OnceCell,
+  RwLock,
+  Semaphore,
+  WaitGroup,
+} from "./primitives.ts";
 
 export const isMainThread = !("WorkerGlobalScope" in globalThis);
 declare const marker: unique symbol;
@@ -25,13 +37,22 @@ declare global {
     fnStr: string,
     url: string,
     baseCacheKey: string,
-  ): Promise<unknown>;
+  ): JoinHandle<unknown>;
+  function __par_wrapper__(
+    token: number,
+    props: Record<string, unknown>,
+    topLevelVars: string[],
+    fnStr: string,
+    url: string,
+    baseCacheKey: string,
+  ): Promise<unknown[]>;
 }
 
 interface PoolEntry {
   worker: Worker;
   busy: boolean;
-  timer?: number;
+  // ReturnType keeps this portable: Deno says number, Node says Timeout.
+  timer?: ReturnType<typeof setTimeout>;
   initialized: boolean;
   dead?: boolean;
 }
@@ -62,8 +83,33 @@ self.close = () => {
 self.onmessage = async ({ data }) => {
   if (data.globalMemory) hydrateGlobalMemory(data.globalMemory);
   const hydratedProps = hydrate(data.props);
+  const ctrl = new AbortController();
+  const cancelFlag = data.cancelFlag ? new Int32Array(data.cancelFlag) : null;
+  let settled = false;
+  if (cancelFlag) {
+    if (Atomics.load(cancelFlag, 0) !== 0) ctrl.abort();
+    else {
+      const res = Atomics.waitAsync(cancelFlag, 0, 0);
+      if (res.async) {
+        res.value.then(() => { if (!settled) ctrl.abort(); });
+      } else ctrl.abort();
+    }
+  }
   try {
-    const result = await (${wrapper})(hydratedProps as any)();
+    let result: any = await (${wrapper})(hydratedProps as any)(ctrl.signal);
+    if (
+      result && typeof result === 'object' && typeof result.next === 'function' &&
+      (Symbol.asyncIterator in result || Symbol.iterator in result)
+    ) {
+      // Generators stream: each yield is posted, the return value is the result.
+      let step;
+      while (!(step = await result.next()).done) {
+        let t: Transferable[] = [];
+        try { t = getTransferables(step.value); } catch (_) {}
+        postMessage({ type: 'yield', value: step.value }, t);
+      }
+      result = step.value;
+    }
     let transfer: Transferable[] = [];
     try { transfer = getTransferables(result); } catch (_) {}
     postMessage({ type: 'success', result }, transfer);
@@ -73,12 +119,19 @@ self.onmessage = async ({ data }) => {
     } catch {
       postMessage({ type: 'error', error: String(error) });
     }
+  } finally {
+    settled = true;
+    // Wake the cancellation wait so it does not outlive the task; otherwise
+    // every task run on a pooled worker would leave a pending wait behind.
+    if (cancelFlag) Atomics.notify(cancelFlag, 0);
   }
 };
 globalThis.__worker_ready__ = true;
 postMessage({ type: 'ready' });`;
 
-export function spawn<T>(fn: () => T): WorkerScript<T> {
+export function spawn<T>(
+  fn: (signal?: AbortSignal) => T,
+): WorkerScript<JoinHandle<T>> {
   const site = getCallSite(import.meta.url);
   const baseCacheKey = `${site.url}:${site.line}:${site.col}`;
 
@@ -91,8 +144,220 @@ export function spawn<T>(fn: () => T): WorkerScript<T> {
     JSON.stringify(topLevels)
   }, ${
     JSON.stringify(fn.toString())
-  }, "${site.url}", "${baseCacheKey}")` as WorkerScript<T>;
+  }, "${site.url}", "${baseCacheKey}")` as WorkerScript<JoinHandle<T>>;
 }
+
+type Yielded<T> = T extends AsyncGenerator<infer Y, any, any> ? Y
+  : T extends Generator<infer Y, any, any> ? Y
+  : never;
+type Joined<T> = T extends AsyncGenerator<any, infer R, any> ? Awaited<R>
+  : T extends Generator<any, infer R, any> ? R
+  : Awaited<T>;
+
+interface JoinHandleHooks {
+  cancel?: () => void;
+  abort?: (reason?: unknown) => void;
+  inline?: boolean;
+}
+
+/**
+ * The thenable returned by `eval(spawn(fn))`. Awaiting it joins the thread.
+ *
+ * - `cancel()` fires the `AbortSignal` passed to the closure (cooperative).
+ * - `abort()` hard-terminates the worker; the handle rejects.
+ * - Generator closures stream: `for await (const v of handle)` consumes
+ *   yields, and awaiting the handle gives the generator's return value.
+ */
+export class JoinHandle<T> implements PromiseLike<Joined<T>> {
+  private readonly _yields: unknown[] = [];
+  private _wake: (() => void)[] = [];
+  private _settled = false;
+
+  constructor(
+    private readonly _promise: Promise<unknown>,
+    private readonly _hooks: JoinHandleHooks = {},
+  ) {}
+
+  /** @internal */
+  _push(value: unknown) {
+    this._yields.push(value);
+    this._notify();
+  }
+
+  /** @internal */
+  _settle() {
+    this._settled = true;
+    this._notify();
+  }
+
+  private _notify() {
+    const wake = this._wake;
+    this._wake = [];
+    for (const w of wake) w();
+  }
+
+  /** Cooperative cancellation: fires the closure's `AbortSignal`. */
+  cancel() {
+    this._hooks.cancel?.();
+  }
+
+  /** Hard-terminates the worker; the handle rejects. */
+  abort(reason?: unknown) {
+    this._hooks.abort?.(reason);
+  }
+
+  then<R1 = Joined<T>, R2 = never>(
+    onfulfilled?: ((value: Joined<T>) => R1 | PromiseLike<R1>) | null,
+    onrejected?: ((reason: unknown) => R2 | PromiseLike<R2>) | null,
+  ): Promise<R1 | R2> {
+    return this._promise.then(
+      onfulfilled as ((value: unknown) => R1 | PromiseLike<R1>) | null,
+      onrejected,
+    );
+  }
+
+  catch<R = never>(
+    onrejected?: ((reason: unknown) => R | PromiseLike<R>) | null,
+  ): Promise<Joined<T> | R> {
+    return this.then(null, onrejected) as Promise<Joined<T> | R>;
+  }
+
+  finally(onfinally?: (() => void) | null): Promise<Joined<T>> {
+    return (this._promise as Promise<Joined<T>>).finally(onfinally);
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<Yielded<T>> {
+    if (this._hooks.inline) {
+      // spawn() at a worker's top level ran inline; delegate to its result.
+      const result = (await this._promise) as any;
+      if (result && typeof result.next === "function") yield* result;
+      return;
+    }
+    while (true) {
+      if (this._yields.length > 0) {
+        yield this._yields.shift() as Yielded<T>;
+        continue;
+      }
+      if (this._settled) {
+        await this._promise; // surfaces the task's error, if any
+        return;
+      }
+      await new Promise<void>((resolve) => this._wake.push(resolve));
+    }
+  }
+}
+
+const SCOPE_STACK: ThreadScope[] = [];
+
+function trackInScope<T>(handle: JoinHandle<T>): JoinHandle<T> {
+  SCOPE_STACK[SCOPE_STACK.length - 1]?._track(handle);
+  return handle;
+}
+
+/**
+ * Structured concurrency scope (Rust's `thread::scope`). Every thread
+ * spawned while the scope is open is joined when it is disposed:
+ *
+ * ```ts
+ * {
+ *   await using _s = scope();
+ *   eval(spawn(() => work()));
+ * } // joins here; the first failure rethrows
+ * ```
+ */
+export class ThreadScope {
+  private readonly _handles: JoinHandle<any>[] = [];
+
+  /** @internal */
+  _track(handle: JoinHandle<any>) {
+    this._handles.push(handle);
+  }
+
+  /** Waits for every tracked thread; rethrows the first failure. */
+  async join(): Promise<void> {
+    const idx = SCOPE_STACK.indexOf(this);
+    if (idx > -1) SCOPE_STACK.splice(idx, 1);
+    const results = await Promise.allSettled(this._handles);
+    const failed = results.find((r) => r.status === "rejected");
+    if (failed) throw (failed as PromiseRejectedResult).reason;
+  }
+
+  async [Symbol.asyncDispose]() {
+    await this.join();
+  }
+}
+
+export function scope(): ThreadScope {
+  const s = new ThreadScope();
+  SCOPE_STACK.push(s);
+  return s;
+}
+
+const PAR_ARGS = new Map<number, readonly unknown[]>();
+let PAR_TOKEN = 0;
+
+/**
+ * Rayon-style parallel map: chunks `items` across up to
+ * `navigator.hardwareConcurrency` pooled workers and preserves order.
+ * Like `spawn`, the result must be passed to `eval()` at the call site.
+ */
+export function par<T, R>(
+  items: readonly T[],
+  fn: (item: T, index: number, signal?: AbortSignal) => R,
+): WorkerScript<Promise<Awaited<R>[]>> {
+  const site = getCallSite(import.meta.url);
+  const baseCacheKey = `${site.url}:${site.line}:${site.col}`;
+
+  if (!SCOPE_ANALYSIS_CACHE.has(baseCacheKey)) analyzeScope(site, baseCacheKey);
+
+  const { locals, topLevels } = SCOPE_ANALYSIS_CACHE.get(baseCacheKey)!;
+  const allVars = [...locals, ...topLevels];
+  PAR_ARGS.set(++PAR_TOKEN, items);
+
+  return `globalThis.__par_wrapper__(${PAR_TOKEN}, {${allVars.join(",")}}, ${
+    JSON.stringify(topLevels)
+  }, ${
+    JSON.stringify(fn.toString())
+  }, "${site.url}", "${baseCacheKey}")` as WorkerScript<Promise<Awaited<R>[]>>;
+}
+
+globalThis.__par_wrapper__ = (
+  token,
+  props,
+  topLevelVars,
+  fnStr,
+  url,
+  baseCacheKey,
+) => {
+  const items = PAR_ARGS.get(token) ?? [];
+  PAR_ARGS.delete(token);
+  if (items.length === 0) return Promise.resolve([]);
+
+  const workers = Math.min(navigator.hardwareConcurrency || 4, items.length);
+  const chunkSize = Math.ceil(items.length / workers);
+  // Each chunk runs the user fn sequentially; parallelism comes from chunks.
+  const chunkFn =
+    `async (__signal) => { const __f = (${fnStr}); const __out = []; ` +
+    `for (let __i = 0; __i < __chunk.length; __i++) ` +
+    `__out.push(await __f(__chunk[__i], __start + __i, __signal)); ` +
+    `return __out; }`;
+
+  const parts: PromiseLike<unknown>[] = [];
+  for (let start = 0; start < items.length; start += chunkSize) {
+    parts.push(globalThis.__worker_wrapper__(
+      {
+        ...props,
+        __chunk: items.slice(start, start + chunkSize),
+        __start: start,
+      },
+      topLevelVars,
+      chunkFn,
+      url,
+      baseCacheKey,
+    ));
+  }
+  return Promise.all(parts).then((r) => (r as unknown[][]).flat());
+};
 
 globalThis.__worker_wrapper__ = (
   props,
@@ -108,8 +373,11 @@ globalThis.__worker_wrapper__ = (
     console.warn("spawn() at module top level runs inline inside workers");
     const wrapper = new Function(
       `return (({${Object.keys(props).join(",")}}) => ${fnStr});`,
-    )() as (p: Record<string, unknown>) => () => unknown;
-    return Promise.resolve().then(() => wrapper(props)());
+    )() as (p: Record<string, unknown>) => (signal?: AbortSignal) => unknown;
+    const inline = Promise.resolve().then(() =>
+      wrapper(props)(new AbortController().signal)
+    );
+    return trackInScope(new JoinHandle<unknown>(inline, { inline: true }));
   }
 
   for (const name of topLevelCandidates) {
@@ -206,7 +474,26 @@ globalThis.__worker_wrapper__ = (
     entry.busy = true;
   }
 
-  return new Promise((resolve, reject) => {
+  const cancelFlag = new Int32Array(new SharedArrayBuffer(4));
+  // Assigned after the Promise executor below, which closes over it.
+  // deno-lint-ignore prefer-const
+  let handle: JoinHandle<unknown> | undefined;
+  let pendingSettle = false;
+  const settle = () => {
+    if (handle) handle._settle();
+    else pendingSettle = true;
+  };
+  let hardAbort: (reason?: unknown) => void = () => {};
+
+  const promise = new Promise((res, rej) => {
+    const resolve = (v: unknown) => {
+      res(v);
+      settle();
+    };
+    const reject = (e: unknown) => {
+      rej(e);
+      settle();
+    };
     const w = entry.worker;
     let cleaned = false;
 
@@ -215,7 +502,7 @@ globalThis.__worker_wrapper__ = (
       try {
         // Captured props are cloned, never transferred: transferring would
         // detach buffers still owned by the calling thread.
-        w.postMessage({ props, globalMemory });
+        w.postMessage({ props, globalMemory, cancelFlag: cancelFlag.buffer });
       } catch (err) {
         cleanup();
         reject(err);
@@ -236,14 +523,19 @@ globalThis.__worker_wrapper__ = (
     };
 
     const onMsg = (e: MessageEvent) => {
-      const { type, result, error } = e.data as {
+      const { type, result, error, value } = e.data as {
         type: string;
         result: unknown;
         error: unknown;
+        value: unknown;
       };
       if (type === "ready") {
         entry.initialized = true;
         sendMessage();
+        return;
+      }
+      if (type === "yield") {
+        handle?._push(value);
         return;
       }
       cleanup();
@@ -258,11 +550,28 @@ globalThis.__worker_wrapper__ = (
       reject(e.error ?? new Error(e.message));
     };
 
+    hardAbort = (reason) => {
+      if (cleaned) return;
+      evict(pool!, entry);
+      cleanup();
+      reject(reason ?? new Error("Thread aborted"));
+    };
+
     w.addEventListener("message", onMsg);
     w.addEventListener("error", onError);
 
     if (entry.initialized) sendMessage();
   });
+
+  handle = new JoinHandle<unknown>(promise, {
+    cancel: () => {
+      Atomics.store(cancelFlag, 0, 1);
+      Atomics.notify(cancelFlag, 0);
+    },
+    abort: (reason) => hardAbort(reason),
+  });
+  if (pendingSettle) handle._settle();
+  return trackInScope(handle);
 };
 
 function evict(pool: PoolEntry[], entry: PoolEntry) {
@@ -292,14 +601,18 @@ function analyzeScope(
 
   const findFn = (n: ts.Node) => {
     if (fnNode) return;
-    if (
-      n.pos <= pos && n.end >= pos && ts.isCallExpression(n) &&
-      n.expression.getText() === "spawn"
-    ) {
-      fnNode = n.arguments[0] as ts.FunctionLikeDeclaration;
-    } else {
-      ts.forEachChild(n, findFn);
+    if (n.pos <= pos && n.end >= pos && ts.isCallExpression(n)) {
+      const callee = n.expression.getText();
+      if (callee === "spawn") {
+        fnNode = n.arguments[0] as ts.FunctionLikeDeclaration;
+        return;
+      }
+      if (callee === "par") {
+        fnNode = n.arguments[1] as ts.FunctionLikeDeclaration;
+        return;
+      }
     }
+    ts.forEachChild(n, findFn);
   };
   findFn(file);
 

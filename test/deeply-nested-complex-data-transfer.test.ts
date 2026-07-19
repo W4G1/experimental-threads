@@ -20,7 +20,7 @@ Deno.test("Deeply Nested Complex Data Transfer", async () => {
       },
     },
     uint8: new Uint8Array([10, 20, 30, 40]),
-    buffer: new ArrayBuffer(8), // Cloned — capture never detaches caller buffers
+    buffer: new ArrayBuffer(8), // Cloned; capture never detaches caller buffers
   };
 
   try {

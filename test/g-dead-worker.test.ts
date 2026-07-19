@@ -26,7 +26,7 @@ Deno.test({
       ]);
       if (r2 === "TIMEOUT") {
         throw new Error(
-          "BUG CONFIRMED: second task hung — dead worker reused from pool",
+          "BUG CONFIRMED: second task hung because a dead worker was reused from the pool",
         );
       }
     } finally {
