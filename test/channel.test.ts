@@ -1,8 +1,8 @@
 import { assertEquals } from "@std/assert";
-import { Channel, Global, shutdown, spawn } from "experimental-threads";
+import { Channel, Shared, shutdown, spawn } from "experimental-threads";
 
-const ch = new Global(new Channel<number>(1024));
-const syncCh = new Global(new Channel<string>(256));
+const ch = new Shared(new Channel<number>(1024));
+const syncCh = new Shared(new Channel<string>(256));
 
 Deno.test("channel streams values from worker to main", async () => {
   try {

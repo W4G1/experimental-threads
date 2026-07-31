@@ -27,7 +27,7 @@ export function getCallSiteId() {
   const base = src && site.url === src.workerUrl
     ? `${src.url}:${site.line - src.lineOffset}:${site.col}`
     : `${site.url}:${site.line}:${site.col}`;
-  // Occurrence index keeps Globals created at the same site (helpers, loops)
+  // Occurrence index keeps Shared instances created at the same site (helpers, loops)
   // distinct, while module re-evaluation still yields matching IDs.
   const count = SITE_COUNTS.get(base) ?? 0;
   SITE_COUNTS.set(base, count + 1);
@@ -59,10 +59,10 @@ export function hydrate(
 
   const o = obj as Record<string, unknown>;
 
-  // Global is not a SharedStruct: restore its prototype without running the
+  // Shared is not a SharedStruct: restore its prototype without running the
   // constructor (which would derive a fresh call-site ID).
-  if (o["__cls"] === "Global" && "_inner" in o) {
-    const g = Object.create(Global.prototype) as Record<string, unknown>;
+  if (o["__cls"] === "Shared" && "_inner" in o) {
+    const g = Object.create(Shared.prototype) as Record<string, unknown>;
     seen.set(obj, g);
     g["id"] = o["id"];
     g["_inner"] = hydrate(o["_inner"], seen);
@@ -95,7 +95,7 @@ export function hydrate(
 }
 
 // Module-private accessor for SharedStruct internals.
-// Avoids scattered @ts-expect-error casts when Global<T> needs to read/write
+// Avoids scattered @ts-expect-error casts when Shared<T> needs to read/write
 // protected and private fields of SharedStruct subclasses.
 interface StructInternals {
   readonly buffer: SharedArrayBuffer;
@@ -139,8 +139,8 @@ export abstract class SharedStruct {
  * from the `SharedArrayBuffer` registered by the parent thread at the same location,
  * guaranteeing referential equality across V8 isolates.
  */
-export class Global<T extends SharedStruct | SharedArrayBuffer> {
-  readonly __cls = "Global";
+export class Shared<T extends SharedStruct | SharedArrayBuffer> {
+  readonly __cls = "Shared";
   private _inner: T;
   private readonly id: string;
 
@@ -341,7 +341,7 @@ const CH_HEADER_BYTES = 32;
 /**
  * A Go-style multi-producer multi-consumer channel backed by a
  * `SharedArrayBuffer` ring buffer, so any isolate holding the same buffer
- * (via `Global<T>` or a captured variable) can send and receive.
+ * (via `Shared<T>` or a captured variable) can send and receive.
  *
  * The constructor argument is the buffer capacity in **bytes**; a full
  * buffer blocks senders, which is the backpressure mechanism. `recv()`

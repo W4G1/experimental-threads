@@ -1,9 +1,9 @@
-import { Global, Mutex, shutdown, spawn } from "experimental-threads";
+import { Mutex, Shared, shutdown, spawn } from "experimental-threads";
 
-// Global declared in the SAME file as the spawn() call (as in the README example)
-const sharedLock = new Global(new Mutex(new SharedArrayBuffer(4)));
+// Shared declared in the SAME file as the spawn() call (as in the README example)
+const sharedLock = new Shared(new Mutex(new SharedArrayBuffer(4)));
 
-Deno.test("Global declared in spawning file is shared with worker", async () => {
+Deno.test("Shared declared in spawning file is shared with worker", async () => {
   try {
     {
       using guard = await sharedLock.value.lock();

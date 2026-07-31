@@ -4,20 +4,20 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { extname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import process from "node:process";
-import { Global, GLOBAL_MEMORY } from "./primitives.ts";
+import { GLOBAL_MEMORY, Shared } from "./primitives.ts";
 import { getCallSite, isStructuredClonable } from "./utils.ts";
 
 export {
   Barrier,
   Channel,
   Condvar,
-  Global,
   Mutex,
   type MutexGuard,
   Once,
   OnceCell,
   RwLock,
   Semaphore,
+  Shared,
   WaitGroup,
 } from "./primitives.ts";
 
@@ -383,7 +383,7 @@ globalThis.__worker_wrapper__ = (
   for (const name of topLevelCandidates) {
     if (name in props) {
       const val = props[name];
-      if (val instanceof Global || !isStructuredClonable(val)) {
+      if (val instanceof Shared || !isStructuredClonable(val)) {
         delete props[name];
       }
     }
@@ -420,7 +420,7 @@ globalThis.__worker_wrapper__ = (
         PATCHED_SOURCE_CACHE.set(url, patchedCode);
       }
 
-      // Maps the copy's call sites back to the original module, so Global
+      // Maps the copy's call sites back to the original module, so Shared
       // IDs derived inside the worker match the main thread's. The two
       // header lines are the offset; patchImports preserves all other
       // positions.
@@ -744,7 +744,7 @@ function bindingHasName(node: ts.BindingName, name: string): boolean {
 
 // Rewrites relative import/export specifiers to absolute URLs by replacing
 // the literal spans in the original text. Unlike re-printing the AST, this
-// preserves every line and column, which Global call-site IDs depend on.
+// preserves every line and column, which Shared call-site IDs depend on.
 function patchImports(code: string, base: string) {
   const file = ts.createSourceFile("x.ts", code, ts.ScriptTarget.ESNext, true);
   const edits: { start: number; end: number; text: string }[] = [];

@@ -1,7 +1,7 @@
 import { assertEquals } from "@std/assert";
-import { Global, scope, shutdown, spawn } from "experimental-threads";
+import { scope, Shared, shutdown, spawn } from "experimental-threads";
 
-const counter = new Global(new SharedArrayBuffer(4));
+const counter = new Shared(new SharedArrayBuffer(4));
 
 Deno.test("scope joins unawaited threads on dispose", async () => {
   try {

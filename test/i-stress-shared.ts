@@ -1,3 +1,3 @@
-import { Global, Mutex } from "experimental-threads";
+import { Mutex, Shared } from "experimental-threads";
 
-export const counter = new Global(new Mutex(new SharedArrayBuffer(4)));
+export const counter = new Shared(new Mutex(new SharedArrayBuffer(4)));

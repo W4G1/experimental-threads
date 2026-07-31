@@ -1,8 +1,8 @@
-import { Global, Mutex, shutdown, spawn } from "experimental-threads";
+import { Mutex, Shared, shutdown, spawn } from "experimental-threads";
 
-Deno.test("Global held in a local variable works in worker", async () => {
+Deno.test("Shared held in a local variable works in worker", async () => {
   try {
-    const g = new Global(new Mutex(new SharedArrayBuffer(4)));
+    const g = new Shared(new Mutex(new SharedArrayBuffer(4)));
     {
       using guard = await g.value.lock();
       new Int32Array(guard.value)[0] = 7;

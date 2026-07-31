@@ -60,16 +60,16 @@ console.log(hash); // "$2b$12$..."
 ### Shared memory and mutexes
 
 Web Workers run in separate V8 isolates, so module-level objects (including
-locks) are independent in each worker. `Global<T>` fixes this by pinning a
+locks) are independent in each worker. `Shared<T>` fixes this by pinning a
 `SharedArrayBuffer`-backed resource to its source location, ensuring all
 isolates share the same underlying memory.
 
 ```typescript
-import { Global, Mutex, spawn } from "experimental-threads";
+import { Mutex, Shared, spawn } from "experimental-threads";
 
-// This Mutex wraps a SharedArrayBuffer. Because it is Global<T>, every
+// This Mutex wraps a SharedArrayBuffer. Because it is Shared<T>, every
 // worker that imports this module gets the same underlying memory buffer.
-const sharedLock = new Global(new Mutex(new SharedArrayBuffer(4)));
+const sharedLock = new Shared(new Mutex(new SharedArrayBuffer(4)));
 
 // Main thread: acquire the lock and write an initial value
 {
@@ -108,9 +108,9 @@ argument is the buffer capacity in bytes; a full buffer blocks senders
 (backpressure).
 
 ```typescript
-import { Channel, Global, spawn } from "experimental-threads";
+import { Channel, Shared, spawn } from "experimental-threads";
 
-const jobs = new Global(new Channel<string>(4096));
+const jobs = new Shared(new Channel<string>(4096));
 
 const producer = eval(spawn(async () => {
   await jobs.value.send("job-1");
@@ -302,11 +302,11 @@ An async counting semaphore backed by `Atomics.waitAsync`.
 Terminates all pooled workers and clears internal caches. Required for clean
 process exit (e.g., at the end of tests).
 
-### `Global<T extends SharedStruct | SharedArrayBuffer>`
+### `Shared<T extends SharedStruct | SharedArrayBuffer>`
 
 Wraps a `SharedArrayBuffer`-backed value and gives it a stable identity across
 isolates derived from its source location (file + line + column). Instantiating
-`Global<T>` at the same call site in any worker will point to the same
+`Shared<T>` at the same call site in any worker will point to the same
 underlying memory as the main thread.
 
 ## Architecture
@@ -334,14 +334,14 @@ JavaScript has no built-in way to inspect the variables captured by a closure.
 ### Shared memory hydration
 
 Because each V8 isolate runs module code independently, a `new Mutex()` in a
-worker creates a fresh, unrelated lock. `Global<T>` solves this with
+worker creates a fresh, unrelated lock. `Shared<T>` solves this with
 location-based identity:
 
-- On the **main thread**, `new Global(value)` registers the underlying
+- On the **main thread**, `new Shared(value)` registers the underlying
   `SharedArrayBuffer` under a key derived from the call site.
 - On a **worker**, the same constructor intercepts the allocation. During
   bootstrap, the main thread sends its full memory registry to the worker. The
-  `Global<T>` constructor looks up its key and hydrates from the parent's buffer
+  `Shared<T>` constructor looks up its key and hydrates from the parent's buffer
   rather than allocating a new one.
 
 This guarantees that `sharedLock.value` in a worker is backed by the same

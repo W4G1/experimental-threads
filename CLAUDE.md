@@ -56,7 +56,7 @@ self-contained worker script.
    variable set. Idle workers are terminated after 30 seconds. A warning fires
    if active workers exceed 4× hardware concurrency.
 
-3. **Shared memory / `Global<T>`** (`src/lib/primitives.ts`): wraps a
+3. **Shared memory / `Shared<T>`** (`src/lib/primitives.ts`): wraps a
    `SharedArrayBuffer` identified by a location-based ID (`file:line:col`). The
    main thread registers buffers in a `GLOBAL_MEMORY` map; workers receive a
    hydration map so they reconstruct the same buffer references across V8

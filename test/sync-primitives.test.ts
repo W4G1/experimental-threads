@@ -3,18 +3,18 @@ import { delay } from "@std/async";
 import {
   Barrier,
   Condvar,
-  Global,
   Mutex,
   Once,
   OnceCell,
   RwLock,
+  Shared,
   shutdown,
   spawn,
   WaitGroup,
 } from "experimental-threads";
 
-const wg = new Global(new WaitGroup());
-const wgCounter = new Global(new SharedArrayBuffer(4));
+const wg = new Shared(new WaitGroup());
+const wgCounter = new Shared(new SharedArrayBuffer(4));
 
 Deno.test("WaitGroup waits for spawned workers", async () => {
   try {

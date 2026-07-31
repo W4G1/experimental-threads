@@ -1,11 +1,11 @@
-import { Global, Semaphore } from "experimental-threads";
+import { Semaphore, Shared } from "experimental-threads";
 
-// No worker needed: two Globals created at the same call site (helper / loop)
+// No worker needed: two Shared instances created at the same call site (helper / loop)
 function makeCounter() {
-  return new Global(new Semaphore(0));
+  return new Shared(new Semaphore(0));
 }
 
-Deno.test("two Globals from the same helper call site are independent", () => {
+Deno.test("two Shared instances from the same helper call site are independent", () => {
   const a = makeCounter();
   const b = makeCounter();
 
