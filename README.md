@@ -215,99 +215,166 @@ sem.release(1); // or release manually
 
 ## API
 
-### `spawn<T>(fn: (signal?: AbortSignal) => T): WorkerScript<JoinHandle<T>>`
+The API is organized around two pieces: run work with `spawn` or `par`, then
+coordinate that work with handles, scopes, shared state, and synchronization
+primitives.
 
-Statically analyzes the closure, identifies its free variables, and returns a
-script string encoding the worker bootstrap. Must be called with `eval()` to
-capture runtime values. The closure receives an `AbortSignal` that fires on
-`handle.cancel()`. Generator closures stream their yields (see `JoinHandle`).
+### Running work
 
-### `par<T, R>(items: readonly T[], fn: (item: T, index: number, signal?: AbortSignal) => R): WorkerScript<Promise<Awaited<R>[]>>`
+#### `WorkerScript<T>`
 
-Parallel map over `items`, chunked across pooled workers. Must be called with
-`eval()` like `spawn`. Items and results are structured-cloned.
+A branded string containing the generated worker bootstrap. `spawn` and `par`
+return a `WorkerScript`; pass it to `eval()` at the call site to bridge the
+caller's lexical scope and obtain the value represented by `T`.
 
-### `JoinHandle<T>`
+#### `spawn`
 
-Returned by `eval(spawn(fn))`. Thenable (`await handle` joins the thread),
-async-iterable (consumes generator yields), plus:
+```typescript
+spawn<T>(
+  fn: (signal?: AbortSignal) => T,
+): WorkerScript<JoinHandle<T>>
+```
 
-- `cancel()`: cooperative cancellation via the closure's `AbortSignal`
-- `abort(reason?)`: hard-terminates the worker; the handle rejects
+Statically analyzes the closure, captures its free variables, and runs it in a
+worker. The optional `AbortSignal` fires when the returned handle is cancelled.
+Generator closures stream their yielded values through the `JoinHandle`.
 
-### `scope(): ThreadScope`
+#### `par`
 
-Opens a structured concurrency scope. Threads spawned while it is open are
-tracked; `await using` (or `await s.join()`) waits for all of them and rethrows
-the first failure.
+```typescript
+par<T, R>(
+  items: readonly T[],
+  fn: (item: T, index: number, signal?: AbortSignal) => R,
+): WorkerScript<Promise<Awaited<R>[]>>
+```
 
-### `Channel<T>`
+Parallel map over `items`, split into chunks across pooled workers. The result
+preserves input order, and the callback receives the original item index. Like
+`spawn`, it must be passed to `eval()` and captures free variables from the call
+site. Items and results are structured-cloned.
 
-SharedArrayBuffer-backed MPMC channel. Values are JSON-serialized into shared
-memory (no typed arrays/BigInt/cycles).
+### Handling threads
 
-- `send(value)` / `recv()`: async, with backpressure; `recv()` resolves
-  `undefined` once closed and drained
-- `sendSync(value)` / `recvSync()`: blocking (`Atomics.wait`); intended for
-  worker threads
-- `trySend(value)` / `tryRecv()`: non-blocking
-- `close()`, `closed`, `size`, `for await (const v of channel)`
-- `Channel.select(channels)`: first available message across channels
+#### `JoinHandle<T>`
 
-### `Mutex<T>`
+Returned by `eval(spawn(fn))`. A handle is thenable, so `await handle` joins the
+thread. It is also async-iterable when `fn` is a generator:
+
+- `for await (const value of handle)`: consumes yielded values
+- `handle.cancel()`: requests cooperative cancellation through `AbortSignal`
+- `handle.abort(reason?)`: terminates the worker; the handle rejects
+- `handle.catch()` / `handle.finally()`: promise-style error and cleanup
+  handling
+
+For a generator, awaiting the handle returns the generator's `return` value, not
+its yielded values.
+
+#### `scope(): ThreadScope`
+
+Opens a structured concurrency scope. Threads spawned while the scope is open
+are tracked and joined when it is disposed:
+
+- `await using _scope = scope()`: joins automatically at the end of the block
+- `threadScope.join()`: explicitly waits for every tracked thread
+
+The first thread failure is rethrown after all tracked threads settle.
+
+### Shared state and communication
+
+#### `Shared<T extends SharedStruct | SharedArrayBuffer>`
+
+Wraps a shared-memory value and gives it a stable identity derived from its
+source location (file, line, and column). Creating `Shared<T>` at the same call
+site in a worker hydrates the same underlying memory as the main thread.
+
+#### `Channel<T>`
+
+An MPMC channel backed by a `SharedArrayBuffer` ring buffer. The constructor's
+capacity is measured in bytes, and values are JSON-serialized, so typed arrays,
+`BigInt`, and cyclic values are not supported.
+
+- `send(value)` / `recv()`: async operations; sending waits for buffer space
+- `sendSync(value)` / `recvSync()`: blocking operations for worker threads
+- `trySend(value)` / `tryRecv()`: non-blocking operations
+- `close()`: closes the channel; `recv()` returns `undefined` after it is
+  drained
+- `closed` / `size`: inspect channel state
+- `for await (const value of channel)`: iterate until closed and drained
+- `Channel.select(channels)`: wait for the first available message
+
+### Synchronization
+
+#### `Mutex<T>`
 
 An async mutual exclusion lock backed by `Atomics.waitAsync`.
 
-- `await mutex.lock(): Promise<MutexGuard<T>>` acquires the lock
-- `guard.unlock()` / `guard[Symbol.dispose]()` releases it
-- Supports `using guard = await mutex.lock()` for automatic release
+- `await mutex.lock()`: returns a `MutexGuard<T>`
+- `guard.value`: accesses the protected value
+- `guard.unlock()` / `guard[Symbol.dispose]()` releases the lock
+- `using guard = await mutex.lock()`: releases the lock automatically
 
-### `RwLock<T>`
+#### `RwLock<T>`
 
-Readers-writer lock: `read()` guards may be held concurrently, `write()` guards
-are exclusive. Both return disposable guards like `Mutex`.
+A readers-writer lock. Multiple `read()` guards may be held concurrently, while
+`write()` guards are exclusive. Both methods return disposable guards like
+`Mutex.lock()`.
 
-### `Condvar`
+#### `Condvar`
 
-Condition variable for use with `Mutex`: `guard = await cv.wait(guard)`
-atomically releases and re-acquires the mutex; `notifyOne()` / `notifyAll()`
-wake waiters. Re-check your condition in a loop (wakeups may be spurious).
+A condition variable used with `Mutex`:
 
-### `WaitGroup`
+- `await cv.wait(guard)`: releases the guard, waits, and re-acquires the mutex
+- `cv.notifyOne()` / `cv.notifyAll()`: wake waiting callers
 
-Go-style: `add(n)`, `done()`, `await wait()` resolves when the counter reaches
-zero.
+Wakeups may be spurious, so re-check the condition in a loop.
 
-### `Once` / `OnceCell<T>`
-
-One-time cross-isolate initialization. `once.do(fn)` runs `fn` in exactly one
-caller. `cell.getOrInit(fn)` additionally shares the JSON-serialized value with
-every isolate; `cell.get()` reads it.
-
-### `Barrier`
-
-`new Barrier(n)`; `await barrier.wait()` resolves once `n` parties arrive
-(`true` for the leader). Reusable across generations.
-
-### `Semaphore`
+#### `Semaphore`
 
 An async counting semaphore backed by `Atomics.waitAsync`.
 
-- `await semaphore.acquire(amount?: number)` decrements permits, blocks if
-  insufficient; returns a disposable guard
-- `semaphore.release(amount?: number)` restores permits and wakes waiters
+- `new Semaphore(permits)`: creates a semaphore with the given permit count
+- `await semaphore.acquire(amount?)`: waits for and holds permits; returns a
+  disposable guard
+- `semaphore.release(amount?)`: restores permits and wakes waiters
 
-### `shutdown(): void`
+#### `WaitGroup`
 
-Terminates all pooled workers and clears internal caches. Required for clean
-process exit (e.g., at the end of tests).
+A Go-style counter for waiting on a group of operations:
 
-### `Shared<T extends SharedStruct | SharedArrayBuffer>`
+- `group.add(n?)`: adds work to the counter
+- `group.done()`: marks one unit of work complete
+- `await group.wait()`: resolves when the counter reaches zero
 
-Wraps a `SharedArrayBuffer`-backed value and gives it a stable identity across
-isolates derived from its source location (file + line + column). Instantiating
-`Shared<T>` at the same call site in any worker will point to the same
-underlying memory as the main thread.
+#### `Once` and `OnceCell<T>`
+
+One-time cross-isolate initialization:
+
+- `once.do(fn)`: runs `fn` in exactly one caller; other callers wait
+- `cell.getOrInit(fn)`: initializes and shares a JSON-serialized value
+- `cell.get()`: reads the initialized value, or `undefined` before
+  initialization
+
+#### `Barrier`
+
+```typescript
+new Barrier(parties);
+```
+
+`await barrier.wait()` resolves when all parties arrive. It returns `true` for
+the leader that trips the barrier and `false` for the others. Barriers are
+reusable across generations.
+
+### Environment and cleanup
+
+#### `isMainThread`
+
+A boolean indicating whether the current code is running in the main thread
+rather than a worker.
+
+#### `shutdown(): void`
+
+Terminates all pooled workers and clears internal caches. Call it when the
+process must exit cleanly, such as at the end of tests.
 
 ## Architecture
 
