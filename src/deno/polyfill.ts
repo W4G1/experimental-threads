@@ -11,7 +11,7 @@
 // contended mutex handoffs), after which it drops to a 10ms timer (negligible
 // CPU, at most ~10ms notification latency).
 
-import { setImmediate } from "node:timers";
+import { clearImmediate, setImmediate } from "node:timers";
 
 const originalWaitAsync = Atomics.waitAsync;
 const FAST_WINDOW_MS = 100;
@@ -31,19 +31,26 @@ Atomics.waitAsync = function (
 
   const wrappedPromise = (async () => {
     let active = true;
+    let immediate: ReturnType<typeof setImmediate> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     // performance.now() is monotonic: a system clock adjustment mid-wait
     // cannot stretch or collapse the fast window like Date.now() could.
     const start = performance.now();
     const keepAlive = () => {
       if (!active) return;
-      if (performance.now() - start < FAST_WINDOW_MS) setImmediate(keepAlive);
-      else setTimeout(keepAlive, SLOW_TICK_MS);
+      if (performance.now() - start < FAST_WINDOW_MS) {
+        immediate = setImmediate(keepAlive);
+      } else {
+        timer = setTimeout(keepAlive, SLOW_TICK_MS);
+      }
     };
     keepAlive();
     try {
       return await result.value;
     } finally {
       active = false;
+      if (immediate !== undefined) clearImmediate(immediate);
+      if (timer !== undefined) clearTimeout(timer);
     }
   })();
 
